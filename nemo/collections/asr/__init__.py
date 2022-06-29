@@ -15,6 +15,7 @@
 from nemo.collections.asr import data, losses, models, modules
 from nemo.package_info import __version__
 
+
 # Set collection version equal to NeMo version.
 __version = __version__
 
