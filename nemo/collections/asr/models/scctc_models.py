@@ -32,15 +32,15 @@ from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecMode
 from nemo.collections.asr.parts.mixins import ASRModuleMixin
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
-from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, LogprobsType, NeuralType, SpectrogramType
+from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, LogprobsType, NeuralType, SpectrogramType, AcousticEncodedRepresentation
 from nemo.core.neural_types.elements import BoolType
 from nemo.utils import logging
 
-__all__ = ['EncDecCTCModel']
+__all__ = ['EncDecSCCTCModel']
 
 
-class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
-    """Base class for encoder decoder CTC-based models."""
+class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
+    """Base class for encoder decoder SC-CTC-based models."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         # Get global rank and total number of GPU workers for IterableDataset partitioning, if applicable
@@ -50,8 +50,8 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             self.world_size = trainer.world_size
 
         super().__init__(cfg=cfg, trainer=trainer)
-        self.preprocessor = EncDecCTCModel.from_config_dict(self._cfg.preprocessor)
-        self.encoder = EncDecCTCModel.from_config_dict(self._cfg.encoder)
+        self.preprocessor = EncDecSCCTCModel.from_config_dict(self._cfg.preprocessor)
+        self.encoder = EncDecSCCTCModel.from_config_dict(self._cfg.encoder)
 
         with open_dict(self._cfg):
             if "feat_in" not in self._cfg.decoder or (
@@ -69,7 +69,7 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
                 )
                 cfg.decoder["num_classes"] = len(self.cfg.decoder.vocabulary)
 
-        self.decoder = EncDecCTCModel.from_config_dict(self._cfg.decoder)
+        self.decoder = EncDecSCCTCModel.from_config_dict(self._cfg.decoder)
 
         self.loss = CTCLoss(
             num_classes=self.decoder.num_classes_with_blank - 1,
@@ -78,7 +78,7 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         )
 
         if hasattr(self._cfg, 'spec_augment') and self._cfg.spec_augment is not None:
-            self.spec_augmentation = EncDecCTCModel.from_config_dict(self._cfg.spec_augment)
+            self.spec_augmentation = EncDecSCCTCModel.from_config_dict(self._cfg.spec_augment)
         else:
             self.spec_augmentation = None
 
@@ -252,7 +252,7 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             new_decoder_config['num_classes'] = len(new_vocabulary)
 
             del self.decoder
-            self.decoder = EncDecCTCModel.from_config_dict(new_decoder_config)
+            self.decoder = EncDecSCCTCModel.from_config_dict(new_decoder_config)
             del self.loss
             self.loss = CTCLoss(
                 num_classes=self.decoder.num_classes_with_blank - 1,
@@ -490,21 +490,21 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-            "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True),
-            "logits": NeuralType(None, BoolType(), optional=True),
+            "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True)
         }
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
         return {
             "outputs": NeuralType(('B', 'T', 'D'), LogprobsType()),
+            "interim_posteriors": NeuralType(('H', 'B', 'T', 'D'), LogprobsType()),
             "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
             "greedy_predictions": NeuralType(('B', 'T'), LabelsType()),
         }
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None, logits=False
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
     ):
         """
         Forward pass of the model.
@@ -542,29 +542,30 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        encoded, iterim_posteriors, encoded_len = self.encoder(audio_signal=processed_signal, decoder=self.decoder, length=processed_signal_length)
         
-        if logits == False:
-            log_probs = self.decoder(encoder_output=encoded)
-            greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
-            return log_probs, encoded_len, greedy_predictions
-        else:
-            return self.decoder(encoder_output=encoded), encoded_len, None
+      
+        log_probs = self.decoder(encoder_output=encoded)
+        greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
+        return log_probs, iterim_posteriors, encoded_len, greedy_predictions
+       
 
 
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
         signal, signal_len, transcript, transcript_len = batch
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            log_probs, encoded_len, predictions = self.forward(
+            log_probs, iterim_posteriors, encoded_len, greedy_predictions = self.forward(
                 processed_signal=signal, processed_signal_length=signal_len
             )
         else:
-            log_probs, encoded_len, predictions = self.forward(input_signal=signal, input_signal_length=signal_len)
+            log_probs, iterim_posteriors, encoded_len, greedy_predictions = self.forward(input_signal=signal, input_signal_length=signal_len)
 
-        loss_value = self.loss(
-            log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
-        )
+        interim_loss = self.loss(log_probs=iterim_posteriors, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len)
+        final_loss = self.loss(log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len)
+
+        interpolate = 0.5 # move this to config
+        loss_value = interpolate * interim_loss + (1 - interpolate) * final_loss # interpolate between interim and final loss
 
         tensorboard_logs = {
             'train_loss': loss_value,
@@ -591,6 +592,9 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         return {'loss': loss_value, 'log': tensorboard_logs}
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        '''
+        NOT UPDATED
+        '''
         signal, signal_len, transcript, transcript_len, sample_id = batch
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             log_probs, encoded_len, predictions = self.forward(
@@ -607,6 +611,9 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         return list(zip(sample_id, transcribed_texts))
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        '''
+        NOT UPDATED See training step
+        '''
         signal, signal_len, transcript, transcript_len = batch
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             log_probs, encoded_len, predictions = self.forward(

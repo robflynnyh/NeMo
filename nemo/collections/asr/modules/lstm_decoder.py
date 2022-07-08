@@ -70,9 +70,12 @@ class LSTMDecoder(NeuralModule, Exportable):
 
     @typecheck()
     def forward(self, encoder_output):
+    
         output = encoder_output.transpose(1, 2)
+     
         output, _ = self.lstm_layer(output)
         output = self.linear_layer(output)
+   
         return torch.nn.functional.log_softmax(output, dim=-1)
 
     def input_example(self, max_batch=1, max_dim=256):

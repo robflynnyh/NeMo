@@ -29,16 +29,18 @@ from nemo.core.classes.common import typecheck
 from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.classes.module import NeuralModule
-from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType
+from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType, LogprobsType
 
-__all__ = ['ConformerEncoder']
+from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
+
+__all__ = ['SelfConditionedConformerEncoder']
 
 
 
 
-class ConformerEncoder(NeuralModule, Exportable):
+class SelfConditionedConformerEncoder(NeuralModule, Exportable):
     """
-    The encoder for ASR model of Conformer.
+    The encoder for ASR model of Self Confitioned Conformer.
     Based on this paper:
     'Conformer: Convolution-augmented Transformer for Speech Recognition' by Anmol Gulati et al.
     https://arxiv.org/abs/2005.08100
@@ -98,6 +100,7 @@ class ConformerEncoder(NeuralModule, Exportable):
         return OrderedDict(
             {
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
+                "decoder": NeuralType(None),
                 "length": NeuralType(tuple('B'), LengthsType()),
             }
         )
@@ -108,6 +111,7 @@ class ConformerEncoder(NeuralModule, Exportable):
         return OrderedDict(
             {
                 "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+                "iterim_posteriors": NeuralType(('H', 'B', 'D', 'T'), LogprobsType()),
                 "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
             }
         )
@@ -239,12 +243,12 @@ class ConformerEncoder(NeuralModule, Exportable):
         self.pos_enc.extend_pe(max_audio_length, device)
 
     @typecheck()
-    def forward(self, audio_signal, length=None):
+    def forward(self, audio_signal, decoder, length=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
-        return self.forward_for_export(audio_signal=audio_signal, length=length)
+        return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length)
 
     @typecheck()
-    def forward_for_export(self, audio_signal, length):
+    def forward_for_export(self, audio_signal, decoder, length):
         max_audio_length: int = audio_signal.size(-1)
 
         if max_audio_length > self.max_audio_length:
@@ -281,15 +285,21 @@ class ConformerEncoder(NeuralModule, Exportable):
         else:
             pad_mask = None
 
+        iterim_posteriors = []
         for lth, layer in enumerate(self.layers):
             audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+            if lth != len(self.layers) - 1:
+                iterim_posteriors.append(decoder(encoder_output=audio_signal.transpose(1, 2))) 
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
      
         audio_signal = torch.transpose(audio_signal, 1, 2) # (batch, seq_len, d_model) -> (batch, d_model, seq_len) 
-     
-        return audio_signal, length
+
+        # stack the posteriors along the first dimension (height, batch, seq_len, dim)
+        iterim_posteriors = torch.stack(iterim_posteriors, dim=0)
+        
+        return audio_signal, iterim_posteriors, length
 
     def update_max_seq_length(self, seq_length: int, device):
         # Find global max audio length across all nodes
@@ -316,7 +326,7 @@ class ConformerEncoder(NeuralModule, Exportable):
         return mask
 
 
-class ConformerEncoderAdapter(ConformerEncoder, adapter_mixins.AdapterModuleMixin):
+class SelfConditionedConformerEncoderAdapter(SelfConditionedConformerEncoder, adapter_mixins.AdapterModuleMixin):
 
     # Higher level forwarding
     def add_adapter(self, name: str, cfg: dict):
@@ -348,5 +358,5 @@ class ConformerEncoderAdapter(ConformerEncoder, adapter_mixins.AdapterModuleMixi
 """
 Register any additional information
 """
-if adapter_mixins.get_registered_adapter(ConformerEncoder) is None:
-    adapter_mixins.register_adapter(base_class=ConformerEncoder, adapter_class=ConformerEncoderAdapter)
+if adapter_mixins.get_registered_adapter(SelfConditionedConformerEncoder) is None:
+    adapter_mixins.register_adapter(base_class=SelfConditionedConformerEncoder, adapter_class=SelfConditionedConformerEncoder)

@@ -49,6 +49,7 @@ from nemo.core.neural_types import (
     SpectrogramType,
 )
 from nemo.utils import logging
+from nemo.collections.asr.losses.ctc import CTCLoss
 
 __all__ = ['ConvASRDecoder', 'ConvASREncoder', 'ConvASRDecoderClassification']
 
@@ -396,6 +397,33 @@ class ParallelConvASREncoder(NeuralModule, Exportable):
 
         return s_input[-1], length
 
+class SelfConditionedBlock(torch.nn.Module):
+    def __init__(self, _feat_in, num_classes, conformer_layer):
+        super().__init__()
+        self.conformer_layer = conformer_layer
+        self.fc = torch.nn.Conv1d(_feat_in, num_classes, 1, bias=True)
+        # log-softmax is applied after the convolution
+        self.softmax = torch.nn.LogSoftmax(dim=-1)
+        # softmax is projected back into dims of input
+        self.softmax_projection = torch.nn.Conv1d(num_classes, _feat_in, 1, bias=False)
+        self.ctcloss = CTCLoss(num_classes=num_classes-1,zero_infinity=True,reduction='mean_batch')
+        
+    def forward(self, x, iter=3, length=None):
+        posts = []
+       
+        for i in range(iter):
+            print('iter:',i)
+            x = self.conformer_layer(x)
+            xfc = self.fc(x)
+          
+            xposterior = self.softmax(x)
+            xprior = self.softmax_projection(x)
+            posts.append(xposterior)
+            x = x + xprior
+        return posts
+        
+
+        
 
 class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin):
     """Simple ASR Decoder for use with CTC-based models such as JasperNet and QuartzNet
@@ -442,14 +470,19 @@ class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin
         self.apply(lambda x: init_weights(x, mode=init_mode))
 
     @typecheck()
-    def forward(self, encoder_output):
+    def forward(self, encoder_output, logits=False):
         # Adapter module forward step
         if self.is_adapter_available():
-            encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
+            encoder_output = encoder_output.transpose(1, 2)  # [B, T, C] 
             encoder_output = self.forward_enabled_adapters(encoder_output)
             encoder_output = encoder_output.transpose(1, 2)  # [B, C, T]
+        
+        out = self.decoder_layers(encoder_output).transpose(1, 2)
+        
+        if logits == False: 
+            out = torch.nn.functional.log_softmax(out, dim=-1)
 
-        return torch.nn.functional.log_softmax(self.decoder_layers(encoder_output).transpose(1, 2), dim=-1)
+        return out
 
     def input_example(self, max_batch=1, max_dim=256):
         """
