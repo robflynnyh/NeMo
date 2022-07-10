@@ -26,6 +26,7 @@ from nemo.collections.asr.modules.scconformer_encoder import SelfConditionedConf
 
 from nemo.collections.asr.modules.conv_asr import (
     ConvASRDecoder,
+    ConvASRSelfConditioningDecoder,
     ConvASRDecoderClassification,
     ConvASRDecoderReconstruction,
     ConvASREncoder,

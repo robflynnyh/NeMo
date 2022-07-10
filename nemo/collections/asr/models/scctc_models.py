@@ -542,10 +542,15 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, iterim_posteriors, encoded_len = self.encoder(audio_signal=processed_signal, decoder=self.decoder, length=processed_signal_length)
+        encoded, iterim_posteriors, encoded_len = self.encoder(
+            audio_signal=processed_signal, 
+            decoder=self.decoder, 
+            length=processed_signal_length,
+            self_condition=True
+        )
         
       
-        log_probs = self.decoder(encoder_output=encoded)
+        log_probs = self.decoder(encoder_output=encoded, logits=False)
         greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
         return log_probs, iterim_posteriors, encoded_len, greedy_predictions
        

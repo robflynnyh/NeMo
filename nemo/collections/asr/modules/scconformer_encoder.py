@@ -102,6 +102,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
                 "decoder": NeuralType(None),
                 "length": NeuralType(tuple('B'), LengthsType()),
+                "self_condition": NeuralType((None))
             }
         )
 
@@ -243,12 +244,12 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         self.pos_enc.extend_pe(max_audio_length, device)
 
     @typecheck()
-    def forward(self, audio_signal, decoder, length=None):
+    def forward(self, audio_signal, decoder, length=None, self_condition:bool=True):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
-        return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length)
+        return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length, self_condition=self_condition)
 
     @typecheck()
-    def forward_for_export(self, audio_signal, decoder, length):
+    def forward_for_export(self, audio_signal, decoder, length, self_condition:bool=True):
         max_audio_length: int = audio_signal.size(-1)
 
         if max_audio_length > self.max_audio_length:
@@ -289,7 +290,13 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         for lth, layer in enumerate(self.layers):
             audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
             if lth != len(self.layers) - 1:
-                iterim_posteriors.append(decoder(encoder_output=audio_signal.transpose(1, 2))) 
+                iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
+                iterim_post = torch.nn.functional.softmax(iterim_logits, dim=-1)
+                iterim_logposteriors = torch.log(iterim_post)
+                iterim_posteriors.append(iterim_logposteriors)
+                if self_condition == True:
+                    audio_signal = audio_signal + decoder.project_back(iterim_post) # states + Linear_v->d(logprobs) self-condition
+                
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output

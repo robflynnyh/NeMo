@@ -51,7 +51,7 @@ from nemo.core.neural_types import (
 from nemo.utils import logging
 from nemo.collections.asr.losses.ctc import CTCLoss
 
-__all__ = ['ConvASRDecoder', 'ConvASREncoder', 'ConvASRDecoderClassification']
+__all__ = ['ConvASRDecoder', 'ConvASREncoder', 'ConvASRDecoderClassification', 'ConvASRSelfConditioningDecoder']
 
 
 class ConvASREncoder(NeuralModule, Exportable):
@@ -397,31 +397,7 @@ class ParallelConvASREncoder(NeuralModule, Exportable):
 
         return s_input[-1], length
 
-class SelfConditionedBlock(torch.nn.Module):
-    def __init__(self, _feat_in, num_classes, conformer_layer):
-        super().__init__()
-        self.conformer_layer = conformer_layer
-        self.fc = torch.nn.Conv1d(_feat_in, num_classes, 1, bias=True)
-        # log-softmax is applied after the convolution
-        self.softmax = torch.nn.LogSoftmax(dim=-1)
-        # softmax is projected back into dims of input
-        self.softmax_projection = torch.nn.Conv1d(num_classes, _feat_in, 1, bias=False)
-        self.ctcloss = CTCLoss(num_classes=num_classes-1,zero_infinity=True,reduction='mean_batch')
-        
-    def forward(self, x, iter=3, length=None):
-        posts = []
-       
-        for i in range(iter):
-            print('iter:',i)
-            x = self.conformer_layer(x)
-            xfc = self.fc(x)
-          
-            xposterior = self.softmax(x)
-            xprior = self.softmax_projection(x)
-            posts.append(xposterior)
-            x = x + xprior
-        return posts
-        
+
 
         
 
@@ -483,6 +459,117 @@ class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin
             out = torch.nn.functional.log_softmax(out, dim=-1)
 
         return out
+
+    def input_example(self, max_batch=1, max_dim=256):
+        """
+        Generates input examples for tracing etc.
+        Returns:
+            A tuple of input examples.
+        """
+        input_example = torch.randn(max_batch, self._feat_in, max_dim).to(next(self.parameters()).device)
+        return tuple([input_example])
+
+    def _prepare_for_export(self, **kwargs):
+        m_count = 0
+        for m in self.modules():
+            if type(m).__name__ == "MaskedConv1d":
+                m.use_mask = False
+                m_count += 1
+        if m_count > 0:
+            logging.warning(f"Turned off {m_count} masked convolutions")
+        Exportable._prepare_for_export(self, **kwargs)
+
+    # Adapter method overrides
+    def add_adapter(self, name: str, cfg: DictConfig):
+        # Update the config with correct input dim
+        cfg = self._update_adapter_cfg_input_dim(cfg)
+        # Add the adapter
+        super().add_adapter(name=name, cfg=cfg)
+
+    def _update_adapter_cfg_input_dim(self, cfg: DictConfig):
+        cfg = adapter_utils.update_adapter_cfg_input_dim(self, cfg, module_dim=self._feat_in)
+        return cfg
+
+    @property
+    def vocabulary(self):
+        return self.__vocabulary
+
+    @property
+    def num_classes_with_blank(self):
+        return self._num_classes
+
+class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin):
+    """Simple ASR Decoder for use with CTC-based models such as JasperNet and QuartzNet
+
+     Based on these papers:
+        https://arxiv.org/pdf/1904.03288.pdf
+        https://arxiv.org/pdf/1910.10261.pdf
+        https://arxiv.org/pdf/2005.04290.pdf
+    """
+
+    @property
+    def input_types(self):
+        return OrderedDict({
+            "encoder_output": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+            "logits": NeuralType((None))
+        })
+
+    @property
+    def output_types(self):
+        return OrderedDict({"logprobs": NeuralType(('B', 'T', 'D'), LogprobsType())})
+
+    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None):
+        super().__init__()
+
+        if vocabulary is None and num_classes < 0:
+            raise ValueError(
+                f"Neither of the vocabulary and num_classes are set! At least one of them need to be set."
+            )
+
+        if num_classes <= 0:
+            num_classes = len(vocabulary)
+            logging.info(f"num_classes of ConvASRDecoder is set to the size of the vocabulary: {num_classes}.")
+
+        if vocabulary is not None:
+            if num_classes != len(vocabulary):
+                raise ValueError(
+                    f"If vocabulary is specified, it's length should be equal to the num_classes. Instead got: num_classes={num_classes} and len(vocabulary)={len(vocabulary)}"
+                )
+            self.__vocabulary = vocabulary
+        self._feat_in = feat_in
+        # Add 1 for blank char
+        self._num_classes = num_classes + 1
+
+        self.decoder_layers = torch.nn.Sequential(
+            torch.nn.Conv1d(self._feat_in, self._num_classes, kernel_size=1, bias=True)
+        )
+        self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim
+            torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True)
+        )
+     
+
+        self.apply(lambda x: init_weights(x, mode=init_mode))
+
+    @typecheck()
+    def forward(self, encoder_output, logits=False):
+        # Adapter module forward step
+        if self.is_adapter_available():
+            encoder_output = encoder_output.transpose(1, 2)  # [B, T, C] 
+            encoder_output = self.forward_enabled_adapters(encoder_output)
+            encoder_output = encoder_output.transpose(1, 2)  # [B, C, T]
+        
+        out = self.decoder_layers(encoder_output).transpose(1, 2)
+        
+        if logits == False: 
+            out = torch.nn.functional.log_softmax(out, dim=-1)
+
+        return out
+
+    def project_back(self, decoder_output):
+        '''
+        Projects the decoder output back to the acoustic models hidden dimension for self-conditioning.
+        '''
+        return self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2)
 
     def input_example(self, max_batch=1, max_dim=256):
         """
