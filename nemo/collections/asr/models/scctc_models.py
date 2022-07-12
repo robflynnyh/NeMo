@@ -545,8 +545,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         encoded, iterim_posteriors, encoded_len = self.encoder(
             audio_signal=processed_signal, 
             decoder=self.decoder, 
-            length=processed_signal_length,
-            self_condition=True
+            length=processed_signal_length
         )
         
       

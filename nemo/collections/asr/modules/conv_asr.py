@@ -544,7 +544,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
             torch.nn.Conv1d(self._feat_in, self._num_classes, kernel_size=1, bias=True)
         )
         self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim
-            torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True)
+            torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) # equivalent to a linear layer 
         )
      
 

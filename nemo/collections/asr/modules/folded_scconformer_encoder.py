@@ -33,12 +33,12 @@ from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, N
 
 from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 
-__all__ = ['SelfConditionedConformerEncoder']
+__all__ = ['FoldedSelfConditionedConformerEncoder']
 
 
 
 
-class SelfConditionedConformerEncoder(NeuralModule, Exportable):
+class FoldedSelfConditionedConformerEncoder(NeuralModule, Exportable):
     """
     The encoder for ASR model of Self Confitioned Conformer.
     Based on this paper:
@@ -121,6 +121,8 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         feat_in,
         n_layers,
         d_model,
+        n_folded_layers=3, 
+        n_repeats=6, # number of repeats of folded layers
         feat_out=-1,
         subsampling='striding',
         subsampling_factor=4,
@@ -206,6 +208,10 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
+        self.n_folded = n_folded_layers
+        assert n_folded_layers < n_layers, "n_folded_layers must be less than n_layers"
+        self.n_repeats = n_repeats
+
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             layer = ConformerLayer(
@@ -289,9 +295,14 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
             pad_mask = None
 
         iterim_posteriors = []
-        for lth, layer in enumerate(self.layers):
+        for lth, layer in enumerate(self.layers[: len(self.layers) - self.n_folded]):
             audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
-            if lth != len(self.layers) - 1:
+
+        for repeat in range(self.n_repeats):
+            for lth, layer in enumerate(self.layers[len(self.layers) - self.n_folded :]):
+                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+                iterim_posteriors.append(audio_signal)
+            if repeat < self.n_repeats - 1: # don't self-condition on last repeat i.e the final output
                 iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
                 iterim_post = torch.nn.functional.softmax(iterim_logits, dim=-1)
                 iterim_logposteriors = torch.log(iterim_post)
@@ -335,7 +346,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         return mask
 
 
-class SelfConditionedConformerEncoderAdapter(SelfConditionedConformerEncoder, adapter_mixins.AdapterModuleMixin):
+class FoldedSelfConditionedConformerEncoderAdapter(FoldedSelfConditionedConformerEncoder, adapter_mixins.AdapterModuleMixin):
 
     # Higher level forwarding
     def add_adapter(self, name: str, cfg: dict):
@@ -367,5 +378,5 @@ class SelfConditionedConformerEncoderAdapter(SelfConditionedConformerEncoder, ad
 """
 Register any additional information
 """
-if adapter_mixins.get_registered_adapter(SelfConditionedConformerEncoder) is None:
-    adapter_mixins.register_adapter(base_class=SelfConditionedConformerEncoder, adapter_class=SelfConditionedConformerEncoder)
+if adapter_mixins.get_registered_adapter(FoldedSelfConditionedConformerEncoder) is None:
+    adapter_mixins.register_adapter(base_class=FoldedSelfConditionedConformerEncoder, adapter_class=FoldedSelfConditionedConformerEncoder)
