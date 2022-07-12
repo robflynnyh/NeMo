@@ -16,7 +16,7 @@ import json
 import os
 import tempfile
 from math import ceil
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, final
 from xmlrpc.client import Boolean
 
 import torch
@@ -100,6 +100,8 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             dist_sync_on_step=True,
             log_prediction=self._cfg.get("log_prediction", False),
         )
+
+        self.is_compositonal = self._cfg.get("is_compositonal", False)
 
         # Setup optional Optimization flags
         self.setup_optimization_flags()
@@ -542,14 +544,24 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, iterim_posteriors, encoded_len = self.encoder(
-            audio_signal=processed_signal, 
-            decoder=self.decoder, 
-            length=processed_signal_length
-        )
+        if self.is_compositonal == False:
+            encoded, iterim_posteriors, encoded_len = self.encoder(
+                audio_signal=processed_signal, 
+                decoder=self.decoder, 
+                length=processed_signal_length
+            )
+            log_probs = self.decoder(encoder_output=encoded, logits=False)
+        else:
+            encoded, iterim_posteriors, iterim_logits_stack, encoded_len = self.encoder(
+                audio_signal=processed_signal, 
+                decoder=self.decoder, 
+                length=processed_signal_length
+            )
+            final_logits = self.decoder(encoder_output=encoded, logits=True)
+            all_logits = iterim_logits_stack + final_logits
+            log_probs = torch.log_softmax(all_logits, dim=-1)
+
         
-      
-        log_probs = self.decoder(encoder_output=encoded, logits=False)
         greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
         return log_probs, iterim_posteriors, encoded_len, greedy_predictions
        
