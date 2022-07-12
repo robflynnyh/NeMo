@@ -321,9 +321,10 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
                 if self.self_condition == True:
                     to_condition = decoder.project_back(iterim_post) # states + Linear_v->d(logprobs) self-condition
                 
-
+        audio_signal = audio_signal + to_condition
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
+
      
         audio_signal = torch.transpose(audio_signal, 1, 2) # (batch, seq_len, d_model) -> (batch, d_model, seq_len) 
 
