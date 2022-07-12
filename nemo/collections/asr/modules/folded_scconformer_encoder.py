@@ -301,7 +301,7 @@ class FoldedSelfConditionedConformerEncoder(NeuralModule, Exportable):
         for repeat in range(self.n_repeats):
             for lth, layer in enumerate(self.layers[len(self.layers) - self.n_folded :]):
                 audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
-                iterim_posteriors.append(audio_signal)
+               
             if repeat < self.n_repeats - 1: # don't self-condition on last repeat i.e the final output
                 iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
                 iterim_post = torch.nn.functional.softmax(iterim_logits, dim=-1)
