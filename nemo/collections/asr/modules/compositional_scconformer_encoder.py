@@ -136,6 +136,7 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         untie_biases=True,
         pos_emb_max_len=5000,
         self_condition=True,
+        discard_intermediates=True,
         conv_kernel_size=31,
         conv_norm_type='batch_norm',
         dropout=0.1,
@@ -154,6 +155,7 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
             self.att_context_size = [-1, -1]
 
         self.self_condition = self_condition
+        self.discard_intermediates = discard_intermediates
 
         if xscaling:
             self.xscale = math.sqrt(d_model)
@@ -302,26 +304,32 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
             audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
         to_condition = None
+    
+        base_encoder_output = audio_signal.clone() # maintain a copy of the base encoder output
 
         for repeat in range(self.n_repeats):
             for lth, layer in enumerate(self.layers[len(self.layers) - self.n_folded :]):
-                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+                if to_condition == None:
+                    audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+                else:
+                    audio_signal = layer(x=audio_signal + to_condition, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
             if repeat < self.n_repeats - 1: # don't self-condition on last repeat i.e the final output
-                if to_condition == None:
-                    iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
-                else:
-                    conditioned_signal = to_condition + audio_signal
-                    iterim_logits = decoder(encoder_output=conditioned_signal.transpose(1, 2), logits=True)
+                iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
+        
                 iterim_logits_stack = iterim_logits if iterim_logits_stack is None else iterim_logits_stack + iterim_logits
             
                 iterim_post = torch.nn.functional.softmax(iterim_logits_stack, dim=-1)
                 iterim_logposteriors = torch.log(iterim_post)
                 iterim_posteriors.append(iterim_logposteriors)
+                
                 if self.self_condition == True:
                     to_condition = decoder.project_back(iterim_post) # states + Linear_v->d(logprobs) self-condition
                 
-        audio_signal = audio_signal + to_condition
+                if self.discard_intermediates == True:
+                    audio_signal = base_encoder_output.clone() # discard the intermediate encoder output
+                
+       
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
 
