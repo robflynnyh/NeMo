@@ -301,19 +301,25 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         for lth, layer in enumerate(self.layers[: len(self.layers) - self.n_folded]):
             audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
+        to_condition = None
+
         for repeat in range(self.n_repeats):
             for lth, layer in enumerate(self.layers[len(self.layers) - self.n_folded :]):
                 audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
             if repeat < self.n_repeats - 1: # don't self-condition on last repeat i.e the final output
-                iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
+                if to_condition == None:
+                    iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
+                else:
+                    conditioned_signal = to_condition + audio_signal
+                    iterim_logits = decoder(encoder_output=conditioned_signal.transpose(1, 2), logits=True)
                 iterim_logits_stack = iterim_logits if iterim_logits_stack is None else iterim_logits_stack + iterim_logits
             
                 iterim_post = torch.nn.functional.softmax(iterim_logits_stack, dim=-1)
                 iterim_logposteriors = torch.log(iterim_post)
                 iterim_posteriors.append(iterim_logposteriors)
                 if self.self_condition == True:
-                    audio_signal = audio_signal + decoder.project_back(iterim_post) # states + Linear_v->d(logprobs) self-condition
+                    to_condition = decoder.project_back(iterim_post) # states + Linear_v->d(logprobs) self-condition
                 
 
         if self.out_proj is not None:
