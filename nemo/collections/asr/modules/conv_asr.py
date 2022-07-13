@@ -546,6 +546,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim
             torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) # equivalent to a linear layer 
         )
+        self.linear_voting_layer = torch.nn.Linear(self._num_classes, self._num_classes)
      
 
         self.apply(lambda x: init_weights(x, mode=init_mode))
