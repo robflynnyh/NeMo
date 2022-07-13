@@ -548,11 +548,9 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         )
      
 
-        if voting_layer:
-            self.voting_layer = torch.nn.Sequential(
-                torch.nn.Linear(self._num_classes, self._num_classes),
-                torch.nn.Tanh()
-            )
+        if voting_layer: # prevent under or overflow before softmax
+            self.voting_layer = lambda x: torch.clamp(x, min=-1000, max=1000)
+            
       
 
         self.apply(lambda x: init_weights(x, mode=init_mode))
