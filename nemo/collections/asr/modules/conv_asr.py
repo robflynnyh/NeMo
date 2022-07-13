@@ -518,7 +518,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
     def output_types(self):
         return OrderedDict({"logprobs": NeuralType(('B', 'T', 'D'), LogprobsType())})
 
-    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None):
+    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None, voting_layer=False):
         super().__init__()
 
         if vocabulary is None and num_classes < 0:
@@ -546,8 +546,14 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim
             torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) # equivalent to a linear layer 
         )
-        self.linear_voting_layer = torch.nn.Linear(self._num_classes, self._num_classes)
      
+
+        if voting_layer:
+            self.voting_layer = torch.nn.Sequential(
+                torch.nn.Linear(self._num_classes, self._num_classes),
+                torch.nn.Tanh()
+            )
+      
 
         self.apply(lambda x: init_weights(x, mode=init_mode))
 

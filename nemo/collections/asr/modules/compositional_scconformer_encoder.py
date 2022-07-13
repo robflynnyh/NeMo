@@ -319,7 +319,7 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         
                 iterim_logits_stack = iterim_logits if iterim_logits_stack is None else iterim_logits_stack + iterim_logits
             
-                iterim_post = torch.nn.functional.softmax(decoder.linear_voting_layer(iterim_logits_stack), dim=-1)
+                iterim_post = torch.nn.functional.softmax(decoder.voting_layer(iterim_logits_stack), dim=-1)
                 iterim_logposteriors = torch.log(iterim_post)
                 iterim_posteriors.append(iterim_logposteriors)
                 
