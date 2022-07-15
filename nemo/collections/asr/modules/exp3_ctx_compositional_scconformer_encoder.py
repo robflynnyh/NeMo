@@ -38,7 +38,7 @@ __all__ = ['CompositionalSelfConditionedConformerEncoder']
 
 
 
-class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
+class experiment3(NeuralModule, Exportable):
     """
     The encoder for ASR model of Self Confitioned Conformer.
     Based on this paper:
@@ -137,7 +137,6 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         untie_biases=True,
         pos_emb_max_len=5000,
         self_condition=True,
-        discard_intermediates=True,
         iterim_loss=False,
         conv_kernel_size=31,
         conv_norm_type='batch_norm',
@@ -160,7 +159,7 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         self.ctx_emb = nn.Embedding(1, self.d_model)
 
         self.self_condition = self_condition
-        self.discard_intermediates = discard_intermediates
+
         self.iterim_loss = iterim_loss
 
         if xscaling:
@@ -265,6 +264,25 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length)
 
+    @staticmethod
+    def splice_ctx_token(audio_signal) -> torch.Tensor:
+        '''
+        Takes a encoder output of shape (batch, 1 + seq_len, d_model)
+        and returns the ctx_token from index 0 of the seq_len from each item in the batch.
+        Output shape should be (batch, 1, d_model) 
+        '''
+        return audio_signal[:, 0, :]
+
+    @staticmethod
+    def insert_ctx_token(audio_signal, ctx_token) -> torch.Tensor:
+        '''
+        Takes a encoder output of shape (batch, 1 + seq_len, d_model)
+        and replaces the ctx_token at index 0 of each sequence with the ctx_token 
+        passed to this function, this function works in-place.
+        '''
+        audio_signal[:, 0, :] = ctx_token
+
+       
  
     def forward_for_export(self, audio_signal, decoder, length):
         max_audio_length: int = audio_signal.size(-1)
@@ -285,11 +303,9 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
             audio_signal, length = self.pre_encode(audio_signal, length)
 
         # create a context embedding equal to the batch
-        ctx_emb = self.ctx_emb(torch.LongTensor([0]*audio_signal.size(0)).to(audio_signal.device))
-        print(ctx_emb.shape, audio_signal.shape)
+        ctx_emb = self.ctx_emb(torch.LongTensor([0]*audio_signal.size(0)).to(audio_signal.device)).unsqueeze(1)
         # add the context embedding to the input along the time dimension of each sample in the batch
         audio_signal = torch.cat([ctx_emb, audio_signal], dim=1)
-        print(audio_signal.shape)
 
         audio_signal, pos_emb = self.pos_enc(audio_signal)
         # adjust size
@@ -347,9 +363,10 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
                 if self.self_condition == True:
                     to_condition = decoder.project_back(iterim_post) # states + Linear_v->d(logprobs) self-condition
                 
-                if self.discard_intermediates == True:
-                    audio_signal = base_encoder_output.clone() # discard the intermediate encoder output
-                
+                cur_ctx_token = self.splice_ctx_token(audio_signal)
+                audio_signal = base_encoder_output.clone() # discard the intermediate encoder output
+                self.insert_ctx_token(audio_signal, cur_ctx_token) # Keep ctx from the previous iteration
+               
        
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
@@ -390,7 +407,7 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         return mask
 
 
-class CompositionalSelfConditionedConformerEncoderAdapter(CompositionalSelfConditionedConformerEncoder, adapter_mixins.AdapterModuleMixin):
+class experiment3Adapter(experiment3, adapter_mixins.AdapterModuleMixin):
 
     # Higher level forwarding
     def add_adapter(self, name: str, cfg: dict):
@@ -422,5 +439,5 @@ class CompositionalSelfConditionedConformerEncoderAdapter(CompositionalSelfCondi
 """
 Register any additional information
 """
-if adapter_mixins.get_registered_adapter(CompositionalSelfConditionedConformerEncoder) is None:
-    adapter_mixins.register_adapter(base_class=CompositionalSelfConditionedConformerEncoder, adapter_class=CompositionalSelfConditionedConformerEncoder)
+if adapter_mixins.get_registered_adapter(experiment3) is None:
+    adapter_mixins.register_adapter(base_class=experiment3, adapter_class=experiment3)
