@@ -262,27 +262,7 @@ class experiment3(NeuralModule, Exportable):
  
     def forward(self, audio_signal, decoder, length=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
-        return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length)
-
-    @staticmethod
-    def splice_ctx_token(audio_signal) -> torch.Tensor:
-        '''
-        Takes a encoder output of shape (batch, 1 + seq_len, d_model)
-        and returns the ctx_token from index 0 of the seq_len from each item in the batch.
-        Output shape should be (batch, 1, d_model) 
-        '''
-        return audio_signal[:, 0, :]
-
-    @staticmethod
-    def insert_ctx_token(audio_signal, ctx_token) -> torch.Tensor:
-        '''
-        Takes a encoder output of shape (batch, 1 + seq_len, d_model)
-        and replaces the ctx_token at index 0 of each sequence with the ctx_token 
-        passed to this function, this function works in-place.
-        '''
-        audio_signal[:, 0, :] = ctx_token
-
-       
+        return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length)       
  
     def forward_for_export(self, audio_signal, decoder, length):
         max_audio_length: int = audio_signal.size(-1)
@@ -340,14 +320,14 @@ class experiment3(NeuralModule, Exportable):
 
         for repeat in range(self.n_repeats):
             if to_condition != None:
-                audio_signal[:,1:,:] = to_condition # first sequence is the context token which doesn't have anything to condition
+                audio_signal[:,1:,:] = to_condition # first sequence is the context token which isn't used for prediction
 
             for lth, layer in enumerate(self.layers[len(self.layers) - self.n_folded :]):
                 audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
              
 
             if repeat < self.n_repeats - 1: # don't self-condition on last repeat i.e the final output
-                iterim_logits = decoder(encoder_output=audio_signal.clone().transpose(1, 2), logits=True)  # clone as otherwise this breaks the gradient when discard_interimediates is False
+                iterim_logits = decoder(encoder_output=audio_signal.clone().transpose(1, 2), logits=True) # clone to avoid gradient errors with in-place operations
            
                 iteration_magnitude_loss = iterim_logits.norm(p=2, dim=-1).mean() / iterim_logits.shape[-1] # this prevents the magnitude of the logits from exploding
                 magnitude_loss = iteration_magnitude_loss if magnitude_loss is None else magnitude_loss + iteration_magnitude_loss  
@@ -363,9 +343,9 @@ class experiment3(NeuralModule, Exportable):
                 if self.self_condition == True:
                     to_condition = decoder.project_back(iterim_post) # states + Linear_v->d(logprobs) self-condition
                 
-                cur_ctx_token = self.splice_ctx_token(audio_signal)
-                audio_signal = base_encoder_output.clone() # discard the intermediate encoder output
-                self.insert_ctx_token(audio_signal, cur_ctx_token) # Keep ctx from the previous iteration
+                
+                audio_signal[:,1:,:] = base_encoder_output.clone()[:,1:,:] # discard intermediate encoder output but keep the context token
+            
                
        
         if self.out_proj is not None:
