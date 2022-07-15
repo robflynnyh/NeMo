@@ -518,7 +518,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
     def output_types(self):
         return OrderedDict({"logprobs": NeuralType(('B', 'T', 'D'), LogprobsType())})
 
-    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None, voting_layer=False):
+    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None, voting_layer=False, remove_ctx=False):
         super().__init__()
 
         if vocabulary is None and num_classes < 0:
@@ -546,9 +546,9 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim
             torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) # equivalent to a linear layer 
         )
-     
+        self.remove_ctx = remove_ctx
 
-        if voting_layer: # prevent under or overflow before softmax
+        if voting_layer: # prevent under or overflow before softmax ## MOVE THIS
             self.voting_layer = lambda x: torch.clamp(x, min=-100, max=100)
       
 
@@ -562,7 +562,10 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
             encoder_output = self.forward_enabled_adapters(encoder_output)
             encoder_output = encoder_output.transpose(1, 2)  # [B, C, T]
         
-        out = self.decoder_layers(encoder_output).transpose(1, 2)
+        if self.remove_ctx == False:
+            out = self.decoder_layers(encoder_output).transpose(1, 2)
+        else: # remove first iterm in each sequence 
+            out = self.decoder_layers(encoder_output[:,:,1:]).transpose(1, 2)
         
         if logits == False: 
             out = torch.nn.functional.log_softmax(out, dim=-1)

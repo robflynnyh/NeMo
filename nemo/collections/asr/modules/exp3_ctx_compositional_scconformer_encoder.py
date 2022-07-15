@@ -340,7 +340,7 @@ class experiment3(NeuralModule, Exportable):
 
         for repeat in range(self.n_repeats):
             if to_condition != None:
-                audio_signal += to_condition
+                audio_signal[:,1:,:] = to_condition # first sequence is the context token which doesn't have anything to condition
 
             for lth, layer in enumerate(self.layers[len(self.layers) - self.n_folded :]):
                 audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
