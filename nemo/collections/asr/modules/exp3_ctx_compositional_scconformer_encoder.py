@@ -156,6 +156,9 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         else:
             self.att_context_size = [-1, -1]
 
+        # embedding layer with 1 vector
+        self.ctx_emb = nn.Embedding(1, self.d_model)
+
         self.self_condition = self_condition
         self.discard_intermediates = discard_intermediates
         self.iterim_loss = iterim_loss
@@ -280,6 +283,13 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
             audio_signal = self.pre_encode(audio_signal)
         else:
             audio_signal, length = self.pre_encode(audio_signal, length)
+
+        # create a context embedding equal to the batch
+        ctx_emb = self.ctx_emb(torch.LongTensor([0]*audio_signal.size(0)).to(audio_signal.device))
+        print(ctx_emb.shape, audio_signal.shape)
+        # add the context embedding to the input along the time dimension of each sample in the batch
+        audio_signal = torch.cat([ctx_emb, audio_signal], dim=1)
+        print(audio_signal.shape)
 
         audio_signal, pos_emb = self.pos_enc(audio_signal)
         # adjust size
