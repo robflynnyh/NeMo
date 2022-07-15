@@ -29,7 +29,7 @@ from nemo.core.classes.common import typecheck
 from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.classes.module import NeuralModule
-from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType, LogprobsType, LogitsType
+from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType, LogprobsType, LogitsType, LossType
 
 from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 
@@ -113,6 +113,7 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
                 "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
                 "iterim_posteriors": NeuralType(('H', 'B', 'D', 'T'), LogprobsType()),
                 "iterim_logits_stack": NeuralType(('B', 'D', 'T'), LogitsType()),
+                "magnitude_loss": NeuralType(None, LossType()),
                 "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
             }
         )
@@ -137,6 +138,7 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
         pos_emb_max_len=5000,
         self_condition=True,
         discard_intermediates=True,
+        iterim_loss=True,
         conv_kernel_size=31,
         conv_norm_type='batch_norm',
         dropout=0.1,
@@ -156,6 +158,7 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
 
         self.self_condition = self_condition
         self.discard_intermediates = discard_intermediates
+        self.iterim_loss = iterim_loss
 
         if xscaling:
             self.xscale = math.sqrt(d_model)
@@ -254,12 +257,12 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
             self.register_buffer('seq_range', seq_range, persistent=False)
         self.pos_enc.extend_pe(max_audio_length, device)
 
-    @typecheck()
+ 
     def forward(self, audio_signal, decoder, length=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length)
 
-    @typecheck()
+ 
     def forward_for_export(self, audio_signal, decoder, length):
         max_audio_length: int = audio_signal.size(-1)
 
@@ -307,21 +310,29 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
     
         base_encoder_output = audio_signal.clone() # maintain a copy of the base encoder output
 
+        magnitude_loss = None
+
         for repeat in range(self.n_repeats):
+            if to_condition != None:
+                audio_signal += to_condition
+
             for lth, layer in enumerate(self.layers[len(self.layers) - self.n_folded :]):
-                if to_condition == None:
-                    audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
-                else:
-                    audio_signal = layer(x=audio_signal + to_condition, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+             
 
             if repeat < self.n_repeats - 1: # don't self-condition on last repeat i.e the final output
-                iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
-        
+                iterim_logits = decoder(encoder_output=audio_signal.clone().transpose(1, 2), logits=True)  # clone as otherwise this breaks the gradient when discard_interimediates is False
+           
+                iteration_magnitude_loss = iterim_logits.norm(p=2, dim=-1).mean() / iterim_logits.shape[-1] # this prevents the magnitude of the logits from exploding
+                magnitude_loss = iteration_magnitude_loss if magnitude_loss is None else magnitude_loss + iteration_magnitude_loss  
+
                 iterim_logits_stack = iterim_logits if iterim_logits_stack is None else iterim_logits_stack + iterim_logits
-            
+
                 iterim_post = torch.nn.functional.softmax(decoder.voting_layer(iterim_logits_stack), dim=-1)
-                iterim_logposteriors = torch.log(iterim_post)
-                iterim_posteriors.append(iterim_logposteriors)
+                if self.iterim_loss == True:
+                    iterim_logposteriors = torch.log(iterim_post)
+                    iterim_posteriors.append(iterim_logposteriors)
+
                 
                 if self.self_condition == True:
                     to_condition = decoder.project_back(iterim_post) # states + Linear_v->d(logprobs) self-condition
@@ -336,10 +347,13 @@ class CompositionalSelfConditionedConformerEncoder(NeuralModule, Exportable):
      
         audio_signal = torch.transpose(audio_signal, 1, 2) # (batch, seq_len, d_model) -> (batch, d_model, seq_len) 
 
-        # stack the posteriors along the first dimension (height, batch, seq_len, dim)
-        iterim_posteriors = torch.stack(iterim_posteriors, dim=0)
+        if self.iterim_loss == True:
+            # stack the posteriors along the first dimension (height, batch, seq_len, dim)
+            iterim_posteriors = torch.stack(iterim_posteriors, dim=0)
+        else:
+            iterim_posteriors = None
         
-        return audio_signal, iterim_posteriors, iterim_logits_stack, length
+        return audio_signal, iterim_posteriors, iterim_logits_stack, magnitude_loss, length
 
     def update_max_seq_length(self, seq_length: int, device):
         # Find global max audio length across all nodes

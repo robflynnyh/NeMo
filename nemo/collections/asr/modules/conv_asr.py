@@ -549,8 +549,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
      
 
         if voting_layer: # prevent under or overflow before softmax
-            self.voting_layer = lambda x: torch.clamp(x, min=-1000, max=1000)
-            
+            self.voting_layer = lambda x: torch.clamp(x, min=-100, max=100)
       
 
         self.apply(lambda x: init_weights(x, mode=init_mode))
@@ -575,6 +574,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         Projects the decoder output back to the acoustic models hidden dimension for self-conditioning.
         '''
         return self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2)
+
 
     def input_example(self, max_batch=1, max_dim=256):
         """

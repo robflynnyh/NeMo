@@ -32,7 +32,7 @@ from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecMode
 from nemo.collections.asr.parts.mixins import ASRModuleMixin
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
-from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, LogprobsType, NeuralType, SpectrogramType, AcousticEncodedRepresentation
+from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, LogprobsType, NeuralType, SpectrogramType, AcousticEncodedRepresentation, LossType
 from nemo.core.neural_types.elements import BoolType
 from nemo.utils import logging
 
@@ -502,6 +502,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             "interim_posteriors": NeuralType(('H', 'B', 'T', 'D'), LogprobsType()),
             "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
             "greedy_predictions": NeuralType(('B', 'T'), LabelsType()),
+            "magnitude_loss": NeuralType(None, LossType()),
         }
 
     @typecheck()
@@ -544,6 +545,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
+        magnitude_loss = None
         if self.is_compositonal == False:
             encoded, iterim_posteriors, encoded_len = self.encoder(
                 audio_signal=processed_signal, 
@@ -552,7 +554,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             )
             log_probs = self.decoder(encoder_output=encoded, logits=False)
         else:
-            encoded, iterim_posteriors, iterim_logits_stack, encoded_len = self.encoder(
+            encoded, iterim_posteriors, iterim_logits_stack, magnitude_loss, encoded_len = self.encoder(
                 audio_signal=processed_signal, 
                 decoder=self.decoder, 
                 length=processed_signal_length
@@ -563,7 +565,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
 
         
         greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
-        return log_probs, iterim_posteriors, encoded_len, greedy_predictions
+        return log_probs, iterim_posteriors, encoded_len, greedy_predictions, magnitude_loss
        
 
 
