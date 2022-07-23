@@ -89,7 +89,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         self.aux_ctc = self._cfg.get("aux_ctc", 0.0)
         if self.aux_ctc > 0.0:
             ## add CTC loss to the encoder as an auxiliary loss
-            self.__init_aux_ctc__(self.encoder.feat_out, self.joint.num_classes_with_blank - 1)
+            self.__init_aux_ctc__(self.encoder._feat_out, self.joint.num_classes_with_blank - 1)
            
 
         # Setup WER calculation
@@ -405,7 +405,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
 
             if self.aux_ctc > 0.0:
                 ## add CTC loss to the encoder as an auxiliary loss
-                self.__init_aux_ctc__(self.encoder.feat_out, self.joint.num_classes_with_blank - 1)
+                self.__init_aux_ctc__(self.encoder._feat_out, self.joint.num_classes_with_blank - 1)
 
             logging.info(f"Changed decoder to output to {self.joint.vocabulary} vocabulary.")
 
