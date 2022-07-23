@@ -330,6 +330,7 @@ class experiment3(NeuralModule, Exportable):
                 iterim_logits = decoder(encoder_output=audio_signal.clone().transpose(1, 2), logits=True) # clone to avoid gradient errors with in-place operations
            
                 iteration_magnitude_loss = iterim_logits.norm(p=2, dim=-1).mean() / iterim_logits.shape[-1] # this prevents the magnitude of the logits from exploding
+        
                 magnitude_loss = iteration_magnitude_loss if magnitude_loss is None else magnitude_loss + iteration_magnitude_loss  
 
                 iterim_logits_stack = iterim_logits if iterim_logits_stack is None else iterim_logits_stack + iterim_logits

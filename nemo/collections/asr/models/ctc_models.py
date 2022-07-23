@@ -549,7 +549,7 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
             return log_probs, encoded_len, greedy_predictions
         else:
-            return self.decoder(encoder_output=encoded), encoded_len, None
+            return self.decoder(encoder_output=encoded, logits=True), encoded_len, None
 
 
     # PTL-specific methods

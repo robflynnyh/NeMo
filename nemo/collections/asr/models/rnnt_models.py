@@ -37,6 +37,8 @@ from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType
 from nemo.utils import logging
 
+from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
+from nemo.collections.asr.losses.ctc import CTCLoss
 
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
     """Base class for encoder decoder RNNT-based models."""
@@ -83,6 +85,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         self.decoding = RNNTDecoding(
             decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, vocabulary=self.joint.vocabulary,
         )
+
+        self.aux_ctc = self._cfg.get("aux_ctc", 0.0)
+        if self.aux_ctc > 0.0:
+            ## add CTC loss to the encoder as an auxiliary loss
+            self.__init_aux_ctc__(self.encoder.feat_out, self.joint.num_classes_with_blank - 1)
+           
+
         # Setup WER calculation
         self.wer = RNNTWER(
             decoding=self.decoding,
@@ -113,6 +122,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
 
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
+
+    def __init_aux_ctc__(self, feat_out, vocab_size):
+        self.aux_decoder = ConvASRDecoder(
+            feat_in=feat_out,
+            num_classes=vocab_size
+        )
+        self.ctc_loss = CTCLoss(num_classes=vocab_size)
 
     def setup_optim_normalization(self):
         """
@@ -386,6 +402,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
                 if key in self.cfg:
                     with open_dict(self.cfg[key]):
                         self.cfg[key]['labels'] = OmegaConf.create(new_vocabulary)
+
+            if self.aux_ctc > 0.0:
+                ## add CTC loss to the encoder as an auxiliary loss
+                self.__init_aux_ctc__(self.encoder.feat_out, self.joint.num_classes_with_blank - 1)
 
             logging.info(f"Changed decoder to output to {self.joint.vocabulary} vocabulary.")
 

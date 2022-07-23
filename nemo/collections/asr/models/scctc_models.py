@@ -560,7 +560,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
                 length=processed_signal_length
             )
             final_logits = self.decoder(encoder_output=encoded, logits=True)
-            all_logits = iterim_logits_stack + final_logits
+            all_logits = iterim_logits_stack + final_logits if iterim_logits_stack is not None else final_logits # if n repeats = 1 then iterim_logits_stack = 0 i.e we only use final_logits
             log_probs = torch.log_softmax(all_logits, dim=-1)
 
         
