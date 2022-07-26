@@ -297,7 +297,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 iterim_logposteriors = torch.log(iterim_post)
                 iterim_posteriors.append(iterim_logposteriors)
                 if self.self_condition == True:
-                    audio_signal = decoder.integrate_projections(audio_signal, *decoder.project_back(iterim_post))
+                    audio_signal = decoder.integrate_projections(audio_signal, decoder.project_back(iterim_post))
                 
 
         if self.out_proj is not None:

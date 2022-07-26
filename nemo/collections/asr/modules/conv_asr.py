@@ -518,7 +518,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
     def output_types(self):
         return OrderedDict({"logprobs": NeuralType(('B', 'T', 'D'), LogprobsType())})
 
-    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None, remove_ctx=False, FiLM=False):
+    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None, remove_ctx=False, gating=False):
         super().__init__()
 
         if vocabulary is None and num_classes < 0:
@@ -546,11 +546,13 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim
             torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) # equivalent to a linear layer 
         )
-        self.FiLM = FiLM
-        if self.FiLM:
-            self.second_reprojection_layers = torch.nn.Sequential(
-                torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True)
-            )
+        self.gating = gating
+        if self.gating:   
+            self.weight_hidden = torch.nn.Linear(self._feat_in, self._feat_in, bias=False)
+            self.weight_embedding = torch.nn.Linear(self._feat_in, self._feat_in, bias=False)
+            self.gating_bias = torch.nn.Parameter(torch.zeros(self._feat_in))
+            self.gating_sigmoid = torch.nn.Sigmoid()
+            
 
         self.remove_ctx = remove_ctx
       
@@ -579,26 +581,18 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         '''
         Projects the decoder output back to the acoustic models hidden dimension for self-conditioning.
         '''
-        if self.FiLM == False:
-            return self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2)
-        else:
-            proj1 = self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2)
-            proj2 = self.second_reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2)
-            return proj1, proj2
+        return self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2)
+      
 
-    def integrate_projections(self, encoder_out, proj1, proj2=None):
-        '''
-        Integrates the projections back to the encoder output.
-        Uses FiLM (feature wise linear modulation if enabled)
-        FiLM: https://arxiv.org/pdf/1709.07871.pdf
-        '''
-        if self.FiLM == True and proj2 == None:
-            raise ValueError("FiLM is enabled but no second projection layer is specified!")
-        if self.FiLM == False:
+    def integrate_projections(self, encoder_out, proj1):
+        if self.gating == False:
             return encoder_out + proj1
         else:
-            return encoder_out * proj1 + proj2
-    
+            embedding = proj1
+            gating_fn = self.gating_sigmoid(self.weight_hidden(encoder_out) + self.weight_embedding(embedding) + self.gating_bias)
+            encoder_new = encoder_out * gating_fn + embedding * (1 - gating_fn)
+            return encoder_new
+
 
 
     def input_example(self, max_batch=1, max_dim=256):
