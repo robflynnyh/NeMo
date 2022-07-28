@@ -133,7 +133,8 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
-        downsampling_type='pooling' # 'pooling' or 'conv'
+        downsampling_type='pooling', #  'pooling' or 'conv'
+        n_repeats=6, # number of repeats of the cross-conformer layers
     ):
         super().__init__()
 
@@ -251,7 +252,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         
         self.downsampling_type = downsampling_type
         if downsampling_type == 'pooling':
-            self.downsampling = nn.AvgPool1d(kernel_size=3, stride=2, count_include_pad=False) # don't count padding in average 
+            self.downsampling = nn.AvgPool1d(kernel_size=3, stride=3, count_include_pad=False) # don't count padding in average 
         elif downsampling_type == 'conv': # NOT IMPLEMENTED YET
             raise ValueError("Convolutional downsampling is not implemented yet!")
             self.downsampling = nn.Conv1d(d_model, d_model, kernel_size=3, stride=3)
@@ -266,6 +267,8 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             self._feat_out = d_model
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
+
+        self.n_repeats = n_repeats
 
     def set_max_audio_length(self, max_audio_length):
         """
@@ -329,96 +332,100 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         for lth, layer in enumerate(self.layers):
             audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
-        # downsample the sequence length using average pooling or convolution
-        
-        if self.downsampling_type == 'pooling': # this isn't pooling the right amount
-            pooled_audio_signal = self.downsampling(audio_signal.transpose(1, 2)).transpose(1, 2) # transpose so that the sequence length is the first dimension
-        
-        # we need to create new masks and pos_embs for the downsampled sequence length
-        max_downsampled_audio_length = pooled_audio_signal.size(1)
-        # calculate new length of each element (without padding) in the downsampled sequence
-        #downsampled_lengths = (length) // 3 # 3 is the downsampling factor # might need to do # this might cause some ISSUEs !!
-        downsampled_lengths = length.div(3, rounding_mode='floor')
+        for _ in range(self.n_repeats):
+            # downsample the sequence length using average pooling or convolution
+            
+            if self.downsampling_type == 'pooling': # this isn't pooling the right amount
+                pooled_audio_signal = self.downsampling(audio_signal.transpose(1, 2)).transpose(1, 2) # transpose so that the sequence length is the first dimension
+            
+            
+            # we need to create new masks and pos_embs for the downsampled sequence length
+            max_downsampled_audio_length = pooled_audio_signal.size(1)
+            # calculate new length of each element (without padding) in the downsampled sequence
+            #downsampled_lengths = (length) // 3 # 3 is the downsampling factor # might need to do # this might cause some ISSUEs !!
+            
+            downsampled_lengths = length.div(3, rounding_mode='floor')
 
-        downsampled_pad_mask = self.make_pad_mask(max_downsampled_audio_length, downsampled_lengths)
+            downsampled_pad_mask = self.make_pad_mask(max_downsampled_audio_length, downsampled_lengths)
 
-        downsampled_att_mask = downsampled_pad_mask.unsqueeze(1).repeat([1, max_downsampled_audio_length, 1])
-        downsampled_att_mask = torch.logical_and(downsampled_att_mask, downsampled_att_mask.transpose(1,2))
-        downsampled_att_mask = ~downsampled_att_mask
-        if self.use_pad_mask:
-            downsampled_pad_mask = ~downsampled_pad_mask
-        else:
-            downsampled_pad_mask = None
-        
-        #pooled_audio_signal, pooled_pos_emb = self.pos_enc(pooled_audio_signal) think this is fine without the pos_emb for the downsampled sequence
-        
-        # create cross attention mask
-        # this is probably aint the best way to do this, but its the easiest way I could think of today
-        # we basically invert the mask, do a dot product between the two, and invert the result
-        # and use that as the mask for the cross attention
-        # because the zeros for padding will cancel out values that would need padding in the dot product
-        # then convert back to bool and invert !
-        # DOUBLE CHECK THIS IS CORRECT IT PROBABLY ISNT
-
-        float_pad_mask = (~pad_mask).float()
-        float_downsampled_pad_mask = (~downsampled_pad_mask).float()
-        # lets create the cross attention mask
-
-        cross_attn_mask = float_downsampled_pad_mask.unsqueeze(-1).matmul(float_pad_mask.unsqueeze(1))
-        cross_attn_mask = ~(cross_attn_mask.bool())
-
-        # make a dummy mask for now to test the cross attention
-        cross_attn_mask = torch.zeros_like(cross_attn_mask).bool()
-
-        downsampled_x = self.CrossConformerLayers[0](
-            qx=pooled_audio_signal, # we take the pooled audio signal as the query, this shortens the sequence length using attention weighting
-            kvx=audio_signal,
-            att_mask=cross_attn_mask,
-            pos_emb=pos_emb, # double check I think pos emb is only added to kv here but idk 100%
-            pad_mask=downsampled_pad_mask
-        )
-        
-        # also need to create a new pad mask for this
-        # and instead of plain concatenating, we need to slice to get rid of the padding
-        # then concatenate left, middle, and right, then add padding back in
-        # so padding is always at the end of the sequence
-        # or just have a really weird padding mask idk
-        # future me can think about this :P
-        cat_downsampled_x = torch.empty((downsampled_x.shape[0], downsampled_x.shape[1]*3, downsampled_x.shape[2]), device=downsampled_x.device)
-        # now concatenate each element of the downsampled audio with its adjacent neighboring elements
-        for i in range(downsampled_x.shape[0]): # iterate over the batch dimension
-            if i == 0: # if first element then there is no left neighbour, so we create a dummy tensor of zeros i.e padding
-                left_neighbour = torch.zeros_like(downsampled_x[i, :, :]) # need to add this to pad masks
+            """
+            downsampled_att_mask = downsampled_pad_mask.unsqueeze(1).repeat([1, max_downsampled_audio_length, 1])
+            downsampled_att_mask = torch.logical_and(downsampled_att_mask, downsampled_att_mask.transpose(1,2))
+            downsampled_att_mask = ~downsampled_att_mask
+            if self.use_pad_mask:
+                downsampled_pad_mask = ~downsampled_pad_mask
             else:
-                left_neighbour = downsampled_x[i-1, :, :]
-            if i == downsampled_x.shape[0]-1: # if last element then there is no right neighbour, so we create a dummy tensor of zeros i.e padding
-                right_neighbour = torch.zeros_like(downsampled_x[i, :, :])
-            else:
-                right_neighbour = downsampled_x[i+1, :, :]
-    
-            cat_downsampled_x[i, :, :] = torch.cat([left_neighbour, downsampled_x[i, :, :], right_neighbour], dim=0) # cat along the sequence length dimension
+                downsampled_pad_mask = None
+            
+            #pooled_audio_signal, pooled_pos_emb = self.pos_enc(pooled_audio_signal) think this is fine without the pos_emb for the downsampled sequence
+            
+            # create cross attention mask
+            # this is probably aint the best way to do this, but its the easiest way I could think of today
+            # we basically invert the mask, do a dot product between the two, and invert the result
+            # and use that as the mask for the cross attention
+            # because the zeros for padding will cancel out values that would need padding in the dot product
+            # then convert back to bool and invert !
+            # DOUBLE CHECK THIS IS CORRECT IT PROBABLY ISNT
 
-        #print(cat_downsampled_x.shape)
-     
-        crosscontext_attn_mask = torch.zeros(cat_downsampled_x.shape[0], audio_signal.shape[1], cat_downsampled_x.shape[1], device=cat_downsampled_x.device).bool()
-        # THIS IS A DUMMY MASK SORT IT OUT LATER PLEASE THANK YOU FUTURE ME x
+            float_pad_mask = (~pad_mask).float()
+            float_downsampled_pad_mask = (~downsampled_pad_mask).float()
+            # lets create the cross attention mask
+
+            cross_attn_mask = float_downsampled_pad_mask.unsqueeze(-1).matmul(float_pad_mask.unsqueeze(1))
+            cross_attn_mask = ~(cross_attn_mask.bool())
+            """
+            # make a dummy mask for now to test the cross attention
+            cross_attn_mask = torch.zeros(audio_signal.shape[0], pooled_audio_signal.shape[1], audio_signal.shape[1], device=audio_signal.device).bool()
+
+            downsampled_x = self.CrossConformerLayers[0](
+                qx=pooled_audio_signal, # we take the pooled audio signal as the query, this shortens the sequence length using attention weighting
+                kvx=audio_signal,
+                att_mask=cross_attn_mask,
+                pos_emb=pos_emb, # double check I think pos emb is only added to kv here but idk 100%
+                pad_mask=downsampled_pad_mask
+            )
+            
+            # also need to create a new pad mask for this
+            # and instead of plain concatenating, we need to slice to get rid of the padding
+            # then concatenate left, middle, and right, then add padding back in
+            # so padding is always at the end of the sequence
+            # or just have a really weird padding mask idk
+            # future me can think about this :P
+            cat_downsampled_x = torch.empty((downsampled_x.shape[0], downsampled_x.shape[1]*3, downsampled_x.shape[2]), device=downsampled_x.device)
+            # now concatenate each element of the downsampled audio with its adjacent neighboring elements
+            for i in range(downsampled_x.shape[0]): # iterate over the batch dimension
+                if i == 0: # if first element then there is no left neighbour, so we create a dummy tensor of zeros i.e padding
+                    left_neighbour = torch.zeros_like(downsampled_x[i, :, :]) # need to add this to pad masks
+                else:
+                    left_neighbour = downsampled_x[i-1, :, :]
+                if i == downsampled_x.shape[0]-1: # if last element then there is no right neighbour, so we create a dummy tensor of zeros i.e padding
+                    right_neighbour = torch.zeros_like(downsampled_x[i, :, :])
+                else:
+                    right_neighbour = downsampled_x[i+1, :, :]
         
-        cross_x = self.CrossConformerLayers[1](
-            qx=audio_signal,
-            kvx=cat_downsampled_x,
-            att_mask=crosscontext_attn_mask,
-            pos_emb=pos_emb,
-            pad_mask=pad_mask
-        )
+                cat_downsampled_x[i, :, :] = torch.cat([left_neighbour, downsampled_x[i, :, :], right_neighbour], dim=0) # cat along the sequence length dimension
 
-        cross_x = audio_signal + cross_x # add the two together i.e a residual/skip connection
-        # now standard conformer layer for feature extraction from cross_x
-        audio_signal = self.CrossConformerLayers[2](
-            x=cross_x,
-            att_mask=att_mask,
-            pos_emb=pos_emb,
-            pad_mask=pad_mask
-        )
+            #print(cat_downsampled_x.shape)
+        
+            crosscontext_attn_mask = torch.zeros(cat_downsampled_x.shape[0], audio_signal.shape[1], cat_downsampled_x.shape[1], device=cat_downsampled_x.device).bool()
+            # THIS IS A DUMMY MASK SORT IT OUT LATER PLEASE THANK YOU FUTURE ME x
+            
+            cross_x = self.CrossConformerLayers[1](
+                qx=audio_signal,
+                kvx=cat_downsampled_x,
+                att_mask=crosscontext_attn_mask,
+                pos_emb=pos_emb,
+                pad_mask=pad_mask
+            )
+
+            cross_x = audio_signal + cross_x # add the two together i.e a residual/skip connection
+            # now standard conformer layer for feature extraction from cross_x
+            audio_signal = self.CrossConformerLayers[2](
+                x=cross_x,
+                att_mask=att_mask,
+                pos_emb=pos_emb,
+                pad_mask=pad_mask
+            )
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
