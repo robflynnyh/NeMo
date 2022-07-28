@@ -28,6 +28,8 @@ from nemo.collections.asr.modules.compositional_scconformer_encoder import Compo
 
 from nemo.collections.asr.modules.exp3_ctx_compositional_scconformer_encoder import experiment3
 
+from nemo.collections.asr.modules.hierarchical_conformer_encoder import HierarchicalConformerEncoder
+
 from nemo.collections.asr.modules.conv_asr import (
     ConvASRDecoder,
     ConvASRSelfConditioningDecoder,

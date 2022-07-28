@@ -99,7 +99,7 @@ class MultiHeadAttention(nn.Module):
         n_batch = value.size(0)
         if mask is not None:
             mask = mask.unsqueeze(1)  # (batch, 1, time1, time2)
-            scores = scores.masked_fill(mask, -10000.0)
+            scores = scores.masked_fill(mask, -10000.0) 
             attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)  # (batch, head, time1, time2)
         else:
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
@@ -202,7 +202,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         matrix_bd = matrix_bd[:, :, :, : matrix_ac.size(-1)]
 
         scores = (matrix_ac + matrix_bd) / self.s_d_k  # (batch, head, time1, time2)
-
+       
         return self.forward_attention(v, scores, mask)
 
 

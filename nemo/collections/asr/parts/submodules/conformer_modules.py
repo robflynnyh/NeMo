@@ -25,7 +25,7 @@ from nemo.core.classes.mixins import AccessMixin
 from nemo.core.classes.mixins.adapter_mixins import AdapterModuleMixin
 from nemo.utils import logging
 
-__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer']
+__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer', 'CrossConformerLayer']
 
 
 class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
@@ -131,6 +131,120 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
 
         return x
 
+
+class CrossConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
+    """A single block of the Conformer encoder.
+
+    Args:
+        d_model (int): input dimension of MultiheadAttentionMechanism and PositionwiseFeedForward
+        d_ff (int): hidden dimension of PositionwiseFeedForward
+        n_heads (int): number of heads for multi-head attention
+        conv_kernel_size (int): kernel size for depthwise convolution in convolution module
+        dropout (float): dropout probabilities for linear layers
+        dropout_att (float): dropout probabilities for attention distributions
+    """
+
+    def __init__(
+        self,
+        d_model,
+        d_ff,
+        self_attention_model='rel_pos',
+        n_heads=4,
+        conv_kernel_size=31,
+        conv_norm_type='batch_norm',
+        dropout=0.1,
+        dropout_att=0.1,
+        pos_bias_u=None,
+        pos_bias_v=None,
+    ):
+        super(CrossConformerLayer, self).__init__()
+
+        self.self_attention_model = self_attention_model
+        self.n_heads = n_heads
+        self.fc_factor = 0.5
+
+        # first feed forward module
+        self.norm_feed_forward1 = LayerNorm(d_model)
+        self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+
+        # convolution module
+        self.norm_conv = LayerNorm(d_model)
+        self.conv = ConformerConvolution(d_model=d_model, kernel_size=conv_kernel_size, norm_type=conv_norm_type)
+
+        # multi-headed self-attention module
+        self.norm_self_att = LayerNorm(d_model)
+        if self_attention_model == 'rel_pos':
+            self.self_attn = RelPositionMultiHeadAttention(
+                n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v
+            )
+        elif self_attention_model == 'abs_pos':
+            self.self_attn = MultiHeadAttention(n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att)
+        else:
+            raise ValueError(
+                f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
+                f"valid values can be from ['rel_pos', 'abs_pos']"
+            )
+
+        # second feed forward module
+        self.norm_feed_forward2 = LayerNorm(d_model)
+        self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+
+        self.dropout = nn.Dropout(dropout)
+        self.norm_out = LayerNorm(d_model)
+
+    def forward(self, qx, kvx, att_mask=None, pos_emb=None, pad_mask=None):
+        """
+        Args:
+            qx (torch.Tensor): input signals (B, T, d_model) to form query (B, T, d_model)
+            kvx (torch.Tensor): input signals (B, T, d_model) to form key and value (B, T, d_model)
+            att_mask (torch.Tensor): attention masks(B, T, T)
+            pos_emb (torch.Tensor): (L, 1, d_model)
+            pad_mask (torch.tensor): padding mask
+        Returns:
+            x (torch.Tensor): (B, T, d_model)
+        """
+        residual_q = qx
+        residual_kv = kvx
+
+        qx = self.norm_feed_forward1(qx)
+        qx = self.feed_forward1(qx)
+
+        kvx = self.norm_feed_forward1(kvx)
+        kvx = self.feed_forward1(kvx)
+
+        residual_q = residual_q + self.dropout(qx) * self.fc_factor
+        residual_kv = residual_kv + self.dropout(kvx) * self.fc_factor
+
+        qx = self.norm_self_att(residual_q)
+        kvx = self.norm_self_att(residual_kv)
+
+        if self.self_attention_model == 'rel_pos':
+            x = self.self_attn(query=qx, key=kvx, value=kvx, mask=att_mask, pos_emb=pos_emb)
+        elif self.self_attention_model == 'abs_pos':
+            x = self.self_attn(query=qx, key=kvx, value=kvx, mask=att_mask)
+        else:
+            x = None # this should never happen
+
+        residual = residual_q + self.dropout(x) # take the residual from the query, as x is formed from the key and value of the self-attention
+
+        x = self.norm_conv(residual)
+        x = self.conv(x, pad_mask)
+        residual = residual + self.dropout(x)
+
+        x = self.norm_feed_forward2(residual)
+        x = self.feed_forward2(x)
+        residual = residual + self.dropout(x) * self.fc_factor
+
+        x = self.norm_out(residual)
+
+        if self.is_adapter_available():
+            # Call the adapters
+            x = self.forward_enabled_adapters(x)
+
+        if self.is_access_enabled():
+            self.register_accessible_tensor(tensor=x)
+
+        return x
 
 class ConformerConvolution(nn.Module):
     """The convolution module for the Conformer model.

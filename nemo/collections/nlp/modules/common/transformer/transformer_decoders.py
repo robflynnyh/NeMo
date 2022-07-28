@@ -125,6 +125,7 @@ class TransformerDecoder(nn.Module):
         hidden_act: str = "relu",
         pre_ln: bool = False,
         pre_ln_final_layer_norm: bool = True,
+        diagonal = 0,
     ):
         super().__init__()
 
@@ -144,7 +145,7 @@ class TransformerDecoder(nn.Module):
             pre_ln,
         )
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
-        self.diagonal = 0
+        self.diagonal = diagonal
 
     def _get_memory_states(self, decoder_states, decoder_mems_list=None, i=0):
         if decoder_mems_list is not None:
