@@ -139,8 +139,11 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         dropout_att=0.0,
         downsampling_type='pooling', #  'pooling' or 'conv'
         n_repeats=3, # number of repeats of the cross-conformer layers
+        checkpoint_last_layer=False # checkpoint the last layer of the cross-conformer, turn of if gpu utilization is very high, vice versa
     ):
         super().__init__()
+
+        self.checkpoint_last_layer = checkpoint_last_layer
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -415,7 +418,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             cross_x = audio_signal + cross_x # add the two together i.e a residual/skip connection
             # now standard conformer layer for feature extraction from cross_x
 
-            if repeat == self.n_repeats - 1: # dont't checkpoint on the last repeat because we need it for the backward pass straight away (pretty much)
+            if repeat == self.n_repeats - 1 or self.checkpoint_last_layer == False: 
                 audio_signal = self.CrossConformerLayers[2](
                     x=cross_x,
                     att_mask=att_mask,
