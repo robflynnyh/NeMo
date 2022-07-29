@@ -33,6 +33,8 @@ from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType
 
+from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
+
 __all__ = ['HierarchicalConformerEncoder']
 
 
@@ -291,6 +293,12 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_for_export(audio_signal=audio_signal, length=length)
 
+    @staticmethod
+    def create_custom_forward(module): # for activation checkpointing allow passing dictionary as the argument to the module
+        def custom_forward(*args, **kwargs):
+            return module(*args, **kwargs)
+        return custom_forward
+
     @typecheck()
     def forward_for_export(self, audio_signal, length):
         max_audio_length: int = audio_signal.size(-1)
@@ -332,15 +340,11 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             pad_mask = None
 
         for lth, layer in enumerate(self.layers):
-            audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+            #audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+            audio_signal = checkpoint(self.create_custom_forward(layer), audio_signal, att_mask, pos_emb, pad_mask)
+        
 
-        def create_custom_forward(module): # for activation checkpointing allow passing dictionary as the argument to the module
-            def custom_forward(inputs):
-                return module(**inputs)
-            return custom_forward
-
-
-        for _ in range(self.n_repeats):
+        for repeat in range(self.n_repeats):
             # downsample the sequence length using average pooling or convolution
             
             if self.downsampling_type == 'pooling': # this isn't pooling the right amount
@@ -356,12 +360,12 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
             downsampled_pad_mask = self.make_pad_mask(max_downsampled_audio_length, downsampled_lengths)
 
-
-            downsampled_x = self.CrossConformerLayers[0](
-                Qs=pooled_audio_signal,
-                KVs=audio_signal,
-                mask=downsampled_pad_mask,
-                context_mask=pad_mask
+    
+            downsampled_x = checkpoint(self.create_custom_forward(self.CrossConformerLayers[0]), 
+                pooled_audio_signal, # Qs
+                audio_signal, # Ks
+                downsampled_pad_mask, # mask 
+                pad_mask # Context mask
             )
             
             # maybe actually I should slice and rearange the padding so it's only at the end of the sequence.. maybe
@@ -400,23 +404,31 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
                 cat_downsampled_x[position, :, :] = full_seq.unsqueeze(0)
                 cat_downsampled_pad_mask[position, :] = cur_pad_mask.reshape(-1)
             
-            #del downsampled_x, downsampled_pad_mask, downsampled_lengths, cat_downsampled_lengths, left_and_right_padding
-
-            cross_x = self.CrossConformerLayers[1](
-                Qs=audio_signal,
-                KVs=cat_downsampled_x,
-                mask=pad_mask,
-                context_mask=cat_downsampled_pad_mask
+     
+            cross_x = checkpoint(self.create_custom_forward(self.CrossConformerLayers[1]), 
+                audio_signal, # Qs
+                cat_downsampled_x, # KVs
+                pad_mask,  # mask
+                cat_downsampled_pad_mask # context_mask
             )
 
             cross_x = audio_signal + cross_x # add the two together i.e a residual/skip connection
             # now standard conformer layer for feature extraction from cross_x
-            audio_signal = self.CrossConformerLayers[2](
-                x=cross_x,
-                att_mask=att_mask,
-                pos_emb=pos_emb,
-                pad_mask=pad_mask
-            )
+
+            if repeat == self.n_repeats - 1: # dont't checkpoint on the last repeat because we need it for the backward pass straight away (pretty much)
+                audio_signal = self.CrossConformerLayers[2](
+                    x=cross_x,
+                    att_mask=att_mask,
+                    pos_emb=pos_emb,
+                    pad_mask=pad_mask
+                )
+            else: 
+                audio_signal = checkpoint(self.create_custom_forward(self.CrossConformerLayers[2]),
+                    cross_x, 
+                    att_mask, 
+                    pos_emb, 
+                    pad_mask
+                )
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output

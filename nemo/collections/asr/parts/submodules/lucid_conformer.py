@@ -11,8 +11,6 @@ from einops import rearrange
 from einops.layers.torch import Rearrange
 from nemo.collections.asr.parts.submodules.x_transformers_local import CrossAttender
 
-from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
-
 
 # helper functions
 
@@ -246,7 +244,7 @@ class CrossConformerBlock(nn.Module):
 
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
-        #self.attn = PreNorm(dim, self.attn) attention layer already handles pre-normalization
+        #self.attn = PreNorm(dim, self.attn) cross attender layer already handles pre-normalization
 
         self.ff1Q = Scale(0.5, PreNorm(dim, self.ff1Q))
         self.ff1KV = Scale(0.5, PreNorm(dim, self.ff1KV))
@@ -254,6 +252,7 @@ class CrossConformerBlock(nn.Module):
         self.ff2 = Scale(0.5, PreNorm(dim, self.ff2))
 
         self.post_norm = nn.LayerNorm(dim)
+
 
     def forward(self, Qs, KVs, mask = None, context_mask = None):
         # Initial Feedforwards scaled by 0.5
