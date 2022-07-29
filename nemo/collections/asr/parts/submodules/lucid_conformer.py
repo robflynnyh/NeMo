@@ -238,7 +238,7 @@ class CrossConformerBlock(nn.Module):
             heads=heads,
             dropout=attn_dropout,
             depth=1,
-            rel_pos_bias=True
+            rel_pos_bias=False # convolutions help handle positional information
         )
 
         self.convQ = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
@@ -246,7 +246,7 @@ class CrossConformerBlock(nn.Module):
 
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
-        self.attn = PreNorm(dim, self.attn)
+        #self.attn = PreNorm(dim, self.attn) attention layer already handles pre-normalization
 
         self.ff1Q = Scale(0.5, PreNorm(dim, self.ff1Q))
         self.ff1KV = Scale(0.5, PreNorm(dim, self.ff1KV))
