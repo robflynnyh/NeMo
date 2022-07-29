@@ -22,6 +22,8 @@ import torch.nn as nn
 from omegaconf import DictConfig
 
 from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer, CrossConformerLayer
+from nemo.collections.asr.parts.submodules.lucid_conformer import CrossConformerBlock
+
 from nemo.collections.asr.parts.submodules.multi_head_attention import PositionalEncoding, RelPositionalEncoding
 from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling, StackingSubsampling
 from nemo.collections.asr.parts.utils import adapter_utils
@@ -134,7 +136,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         dropout_emb=0.1,
         dropout_att=0.0,
         downsampling_type='pooling', #  'pooling' or 'conv'
-        n_repeats=6, # number of repeats of the cross-conformer layers
+        n_repeats=3, # number of repeats of the cross-conformer layers
     ):
         super().__init__()
 
@@ -222,19 +224,19 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
         self.CrossConformerLayers = nn.ModuleList()
         for i in range(2):
-            layer = CrossConformerLayer(
-                d_model=d_model,
-                d_ff=d_ff,
-                self_attention_model=self_attention_model,
-                n_heads=n_heads,
+            layer = CrossConformerBlock(
+                dim=d_model,
+                heads=n_heads,
+                dim_head=d_model // n_heads,
+                ff_mult=ff_expansion_factor,
+                conv_expansion_factor = 2,
                 conv_kernel_size=conv_kernel_size,
-                conv_norm_type=conv_norm_type,
-                dropout=dropout,
-                dropout_att=dropout_att,
-                pos_bias_u=pos_bias_u,
-                pos_bias_v=pos_bias_v,
+                attn_dropout=dropout_att,
+                ff_dropout=dropout,
+                conv_dropout=dropout,
             )
             self.CrossConformerLayers.append(layer)
+
         layer = ConformerLayer(
             d_model=d_model,
             d_ff=d_ff,
@@ -332,6 +334,12 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         for lth, layer in enumerate(self.layers):
             audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
+        def create_custom_forward(module): # for activation checkpointing allow passing dictionary as the argument to the module
+            def custom_forward(inputs):
+                return module(**inputs)
+            return custom_forward
+
+
         for _ in range(self.n_repeats):
             # downsample the sequence length using average pooling or convolution
             
@@ -348,74 +356,57 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
             downsampled_pad_mask = self.make_pad_mask(max_downsampled_audio_length, downsampled_lengths)
 
-            """
-            downsampled_att_mask = downsampled_pad_mask.unsqueeze(1).repeat([1, max_downsampled_audio_length, 1])
-            downsampled_att_mask = torch.logical_and(downsampled_att_mask, downsampled_att_mask.transpose(1,2))
-            downsampled_att_mask = ~downsampled_att_mask
-            if self.use_pad_mask:
-                downsampled_pad_mask = ~downsampled_pad_mask
-            else:
-                downsampled_pad_mask = None
-            
-            #pooled_audio_signal, pooled_pos_emb = self.pos_enc(pooled_audio_signal) think this is fine without the pos_emb for the downsampled sequence
-            
-            # create cross attention mask
-            # this is probably aint the best way to do this, but its the easiest way I could think of today
-            # we basically invert the mask, do a dot product between the two, and invert the result
-            # and use that as the mask for the cross attention
-            # because the zeros for padding will cancel out values that would need padding in the dot product
-            # then convert back to bool and invert !
-            # DOUBLE CHECK THIS IS CORRECT IT PROBABLY ISNT
-
-            float_pad_mask = (~pad_mask).float()
-            float_downsampled_pad_mask = (~downsampled_pad_mask).float()
-            # lets create the cross attention mask
-
-            cross_attn_mask = float_downsampled_pad_mask.unsqueeze(-1).matmul(float_pad_mask.unsqueeze(1))
-            cross_attn_mask = ~(cross_attn_mask.bool())
-            """
-            # make a dummy mask for now to test the cross attention
-            cross_attn_mask = torch.zeros(audio_signal.shape[0], pooled_audio_signal.shape[1], audio_signal.shape[1], device=audio_signal.device).bool()
 
             downsampled_x = self.CrossConformerLayers[0](
-                qx=pooled_audio_signal, # we take the pooled audio signal as the query, this shortens the sequence length using attention weighting
-                kvx=audio_signal,
-                att_mask=cross_attn_mask,
-                pos_emb=pos_emb, # double check I think pos emb is only added to kv here but idk 100%
-                pad_mask=downsampled_pad_mask
+                Qs=pooled_audio_signal,
+                KVs=audio_signal,
+                mask=downsampled_pad_mask,
+                context_mask=pad_mask
             )
             
-            # also need to create a new pad mask for this
-            # and instead of plain concatenating, we need to slice to get rid of the padding
-            # then concatenate left, middle, and right, then add padding back in
-            # so padding is always at the end of the sequence
-            # or just have a really weird padding mask idk
-            # future me can think about this :P
-            cat_downsampled_x = torch.empty((downsampled_x.shape[0], downsampled_x.shape[1]*3, downsampled_x.shape[2]), device=downsampled_x.device)
-            # now concatenate each element of the downsampled audio with its adjacent neighboring elements
-            for i in range(downsampled_x.shape[0]): # iterate over the batch dimension
-                if i == 0: # if first element then there is no left neighbour, so we create a dummy tensor of zeros i.e padding
-                    left_neighbour = torch.zeros_like(downsampled_x[i, :, :]) # need to add this to pad masks
-                else:
-                    left_neighbour = downsampled_x[i-1, :, :]
-                if i == downsampled_x.shape[0]-1: # if last element then there is no right neighbour, so we create a dummy tensor of zeros i.e padding
-                    right_neighbour = torch.zeros_like(downsampled_x[i, :, :])
-                else:
-                    right_neighbour = downsampled_x[i+1, :, :]
-        
-                cat_downsampled_x[i, :, :] = torch.cat([left_neighbour, downsampled_x[i, :, :], right_neighbour], dim=0) # cat along the sequence length dimension
-
-            #print(cat_downsampled_x.shape)
-        
-            crosscontext_attn_mask = torch.zeros(cat_downsampled_x.shape[0], audio_signal.shape[1], cat_downsampled_x.shape[1], device=cat_downsampled_x.device).bool()
-            # THIS IS A DUMMY MASK SORT IT OUT LATER PLEASE THANK YOU FUTURE ME x
+            # maybe actually I should slice and rearange the padding so it's only at the end of the sequence.. maybe
             
+            cat_downsampled_pad_mask = torch.empty(downsampled_pad_mask.shape[0], downsampled_pad_mask.shape[1]*3, dtype=torch.bool, device=downsampled_pad_mask.device)
+            cat_downsampled_x = torch.empty((downsampled_x.shape[0], downsampled_x.shape[1]*3, downsampled_x.shape[2]), device=downsampled_x.device)
+            padding_length = torch.tensor([0], dtype=torch.int32, device=downsampled_lengths.device) # padding items have a sequence length of 0
+            cat_downsampled_lengths = torch.cat([padding_length,  downsampled_lengths, padding_length], dim=0)
+
+            left_and_right_padding = torch.zeros_like(downsampled_x[0, :, :]).unsqueeze(0)
+            downsampled_x = torch.cat((left_and_right_padding, downsampled_x, left_and_right_padding), dim=0) 
+         
+            # hopefully I can think of a nicer way to do this
+            for i in range(1, downsampled_x.shape[0]-1): # skip the first and last element (the padding)
+                position = i - 1 
+                left_seq = downsampled_x[i-1, :cat_downsampled_lengths[i-1], :]
+                left_seq_padding = downsampled_x[i-1, cat_downsampled_lengths[i-1]:, :]
+                #
+                right_seq = downsampled_x[i+1, :cat_downsampled_lengths[i+1], :]
+                right_seq_padding = downsampled_x[i+1, cat_downsampled_lengths[i+1]:, :]
+                #
+                middle_seq = downsampled_x[i, :cat_downsampled_lengths[i], :]
+                middle_seq_padding = downsampled_x[i, cat_downsampled_lengths[i]:, :]
+                #
+                # now concatenate all these things (clean this all up later future me)
+                non_pad_seq = torch.cat((left_seq, middle_seq, right_seq), dim=0)
+                pad_seq = torch.cat((left_seq_padding, middle_seq_padding, right_seq_padding), dim=0)
+
+                full_seq = torch.cat((non_pad_seq, pad_seq), dim=0)
+                #del pad_seq, left_seq, left_seq_padding, right_seq, right_seq_padding, middle_seq, middle_seq_padding
+                # IDEA/TODO: maybe to avoid messing with the padding, I should just add the padding to the end of the non-padded sequence, and then pad the end of the full sequence
+
+                cur_pad_mask = torch.ones(cat_downsampled_x[position, :, :].shape[0], dtype=torch.bool, device=downsampled_x.device)
+                cur_pad_mask[:non_pad_seq.shape[0]] = False
+
+                cat_downsampled_x[position, :, :] = full_seq.unsqueeze(0)
+                cat_downsampled_pad_mask[position, :] = cur_pad_mask.reshape(-1)
+            
+            #del downsampled_x, downsampled_pad_mask, downsampled_lengths, cat_downsampled_lengths, left_and_right_padding
+
             cross_x = self.CrossConformerLayers[1](
-                qx=audio_signal,
-                kvx=cat_downsampled_x,
-                att_mask=crosscontext_attn_mask,
-                pos_emb=pos_emb,
-                pad_mask=pad_mask
+                Qs=audio_signal,
+                KVs=cat_downsampled_x,
+                mask=pad_mask,
+                context_mask=cat_downsampled_pad_mask
             )
 
             cross_x = audio_signal + cross_x # add the two together i.e a residual/skip connection
