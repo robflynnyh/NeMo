@@ -518,8 +518,29 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
     def output_types(self):
         return OrderedDict({"logprobs": NeuralType(('B', 'T', 'D'), LogprobsType())})
 
-    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None, remove_ctx=False, gating=False):
+    def __init__(
+        self, 
+        feat_in, 
+        num_classes, 
+        init_mode="xavier_uniform", 
+        vocabulary=None, 
+        remove_ctx=False, 
+        gating=False,
+        auxilary_training=False # train reprojection layer using word embedding task
+    ):
         super().__init__()
+
+
+        self.auxilary_training = auxilary_training
+        if self.auxilary_training == True:
+            self.left_word_prediction = torch.nn.Linear(
+                feat_in,
+                num_classes
+            )
+            self.right_word_prediction = torch.nn.Linear(
+                feat_in,
+                num_classes
+            )
 
         if vocabulary is None and num_classes < 0:
             raise ValueError(
@@ -543,9 +564,11 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         self.decoder_layers = torch.nn.Sequential(
             torch.nn.Conv1d(self._feat_in, self._num_classes, kernel_size=1, bias=True)
         )
-        self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim
-            torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) # equivalent to a linear layer 
+
+        self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim. Change to linear !
+            torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) 
         )
+
         self.gating = gating
         if self.gating:   
             self.weight_hidden = torch.nn.Linear(self._feat_in, self._feat_in, bias=False)
@@ -593,7 +616,13 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
             encoder_new = encoder_out * gating_fn + embedding * (1 - gating_fn)
             return encoder_new
 
-
+    def auxilary_task(self, input_tokens): # NOT DONE
+        assert self.auxilary_training == True, "auxilary_training is not set to True"
+        word_embeddings = self.reprojection_layers.weight.T.squeeze()[input_tokens]
+        left_word_prediction = self.left_word_prediction(word_embeddings)
+        right_word_prediction = self.right_word_prediction(word_embeddings)
+        
+        return left_word_prediction, right_word_prediction
 
     def input_example(self, max_batch=1, max_dim=256):
         """

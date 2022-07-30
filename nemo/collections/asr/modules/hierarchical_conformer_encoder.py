@@ -139,9 +139,22 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         dropout_att=0.0,
         downsampling_type='pooling', #  'pooling' or 'conv'
         n_repeats=3, # number of repeats of the cross-conformer layers
-        checkpoint_last_layer=False # checkpoint the last layer of the cross-conformer, turn of if gpu utilization is very high, vice versa
+        checkpoint_last_layer=False, # checkpoint the last layer of the cross-conformer, turn of if gpu utilization is very high, vice versa
+        FiLM = True, # use FiLM for context integration
+        sigmoid_gating=False
     ):
         super().__init__()
+
+        self.FiLM = FiLM
+        self.sigmoid_gating = sigmoid_gating
+
+        assert not (self.FiLM and self.sigmoid_gating), "FiLM and sigmoid_gating cannot be used together"
+
+        if self.FiLM:
+            self.init_FiLM(d_model=d_model)
+        elif self.sigmoid_gating:
+            self.init_sigmoid_gating(d_model=d_model)
+        
 
         self.checkpoint_last_layer = checkpoint_last_layer
 
@@ -277,6 +290,30 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
         self.n_repeats = n_repeats
 
+    def init_FiLM(self, d_model):
+        '''
+        https://arxiv.org/pdf/1709.07871.pdf
+        '''
+        self.FiLM_r = nn.Linear(d_model, d_model)
+        self.FiLM_h = nn.Linear(d_model, d_model)
+
+    def apply_FiLM(self, x, x_context):
+        r = self.FiLM_r(x_context)
+        h = self.FiLM_h(x_context)
+        return x * r + h
+
+    def init_sigmoid_gating(self, d_model):
+        self.sigmoid_gating_w1 = nn.Linear(d_model, d_model, bias=False)
+        self.sigmoid_gating_w2 = nn.Linear(d_model, d_model, bias=False)
+        self.sigmoid_gating_b = nn.Parameter(torch.zeros(1, d_model))
+        self.sigmoid = nn.Sigmoid()
+
+    def apply_sigmoid_gating(self, x, x_context):
+        W1o = self.sigmoid_gating_w1(x_context)
+        W2o = self.sigmoid_gating_w2(x)
+        gate = self.sigmoid(W1o + W2o + self.sigmoid_gating_b)
+        return x * gate + x_context * (1 - gate)
+
     def set_max_audio_length(self, max_audio_length):
         """
         Sets maximum input length.
@@ -357,9 +394,9 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             # we need to create new masks and pos_embs for the downsampled sequence length
             max_downsampled_audio_length = pooled_audio_signal.size(1)
             # calculate new length of each element (without padding) in the downsampled sequence
-            #downsampled_lengths = (length) // 3 # 3 is the downsampling factor # might need to do # this might cause some ISSUEs !!
             
-            downsampled_lengths = length.div(3, rounding_mode='floor')
+            downsampled_lengths = length.div(3, rounding_mode=None).ceil().int()
+
 
             downsampled_pad_mask = self.make_pad_mask(max_downsampled_audio_length, downsampled_lengths)
 
@@ -415,7 +452,14 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
                 cat_downsampled_pad_mask # context_mask
             )
 
-            cross_x = audio_signal + cross_x # add the two together i.e a residual/skip connection
+            if self.sigmoid_gating:
+                cross_x = self.apply_sigmoid_gating(audio_signal, cross_x)
+            else:
+                cross_x = audio_signal + cross_x # add the two together i.e a residual/skip connection
+
+                if self.FiLM: # Feature combination (FiLM) - Feature Wise Linear Modulation
+                    cross_x = self.apply_FiLM(audio_signal, cross_x)
+            
             # now standard conformer layer for feature extraction from cross_x
 
             if repeat == self.n_repeats - 1 or self.checkpoint_last_layer == False: 
