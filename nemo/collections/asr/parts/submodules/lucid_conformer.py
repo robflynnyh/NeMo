@@ -1,6 +1,7 @@
 '''
-Mostly all taken from lucidrain's GitHub repository: https://github.com/lucidrains/conformer
-The Cross-Conformer block is adapted from this repository
+Most of this is from lucidrain's GitHub repository: https://github.com/lucidrains/conformer
+Apart from Cross-Conformer i.e funnel and integration which, adapt from the original code, 
+and use xtransformers library for the cross-attention
 '''
 
 import torch
@@ -208,7 +209,7 @@ class ConformerBlock(nn.Module):
         return x
 
 
-class CrossConformerBlock(nn.Module):
+class FunnelConformerBlock(nn.Module):
     '''
     Similar to this: https://arxiv.org/pdf/2111.00127.pdf
     '''
@@ -261,7 +262,115 @@ class CrossConformerBlock(nn.Module):
         Qs = self.convQ(Qs) + Qs
         KVs = self.convKV(KVs) + KVs
 
-        x = self.attn(x=Qs, context=KVs, mask=mask, context_mask=context_mask) + Qs
+        x = self.attn(x=Qs, context=KVs, mask=mask, context_mask=context_mask) + Qs # possibly don't add the residual here
+        x = self.ff2(x) + x
+        x = self.post_norm(x)
+        
+        return x
+
+
+class IntegrationConformerBlock(nn.Module):
+    '''
+    Similar to this: https://arxiv.org/pdf/2111.00127.pdf
+    '''
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_head = 64,
+        heads = 8,
+        ff_mult = 4,
+        conv_expansion_factor = 2,
+        conv_kernel_size = 31,
+        attn_dropout = 0.,
+        ff_dropout = 0.,
+        conv_dropout = 0.,
+        gating_method = 'FiLM'
+    ):
+        super().__init__()
+        self.ff1Q = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
+        self.ff1KV = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
+        
+        self.gating_method = gating_method
+        assert gating_method in ['FiLM', 'Conv', 'None'], 'Gating method must be one of FiLM, Conv, or None'
+        
+        self.gating_fn = lambda q, context: context
+        if gating_method == 'FiLM':
+            self.init_FiLM(d_model=dim)
+            self.gating_fn = self.apply_FiLM
+        elif gating_method == 'Conv':
+            self.init_Conv(d_model=dim)
+            self.gating_fn = self.apply_Conv
+
+        #self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
+        self.attn1 = CrossAttender( # TODO: convert attention in this class to handle cross attention 
+            dim=dim,
+            dim_head=dim_head,
+            heads=heads,
+            dropout=attn_dropout,
+            depth=1,
+            rel_pos_bias=False # convolutions help handle positional information
+        )
+
+        self.attn2 = CrossAttender( 
+            dim=dim,
+            dim_head=dim_head,
+            heads=heads,
+            dropout=attn_dropout,
+            depth=1,
+            rel_pos_bias=False # convolutions help handle positional information
+        )
+
+        self.convQ = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
+        self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
+
+        self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
+
+        #self.attn = PreNorm(dim, self.attn) cross attender layer already handles pre-normalization
+
+        self.ff1Q = Scale(0.5, PreNorm(dim, self.ff1Q))
+        self.ff1KV = Scale(0.5, PreNorm(dim, self.ff1KV))
+
+        self.ff2 = Scale(0.5, PreNorm(dim, self.ff2))
+
+        self.post_norm = nn.LayerNorm(dim)
+
+    def init_sigmoid_gating(self, d_model):
+        self.sigmoid_gating_w1 = nn.Linear(d_model, d_model, bias=False)
+        self.sigmoid_gating_w2 = nn.Linear(d_model, d_model, bias=False)
+        self.sigmoid_gating_b = nn.Parameter(torch.zeros(1, d_model))
+        self.sigmoid = nn.Sigmoid()
+
+    def init_FiLM(self, d_model):
+        '''
+        https://arxiv.org/pdf/1709.07871.pdf
+        '''
+        self.FiLM_r = nn.Linear(d_model, d_model)
+        self.FiLM_h = nn.Linear(d_model, d_model)
+
+    def apply_FiLM(self, q, x_context):
+        r = self.FiLM_r(x_context)
+        h = self.FiLM_h(x_context)
+        return q * r + h
+
+    def apply_sigmoid_gating(self, q, x_context):
+        W1o = self.sigmoid_gating_w1(x_context)
+        W2o = self.sigmoid_gating_w2(q)
+        gate = self.sigmoid(W1o + W2o + self.sigmoid_gating_b)
+        return q * gate + x_context * (1 - gate)
+
+    def forward(self, Qs, KVs, mask = None, context_mask = None):
+        Qs = self.ff1Q(Qs) + Qs
+        KVs = self.ff1KV(KVs) + KVs
+
+        Qs = self.convQ(Qs) + Qs
+        KVs = self.convKV(KVs) + KVs
+
+        x = self.attn1(x=Qs, context=KVs, mask=mask, context_mask=context_mask) + Qs
+        x = self.gating_fn(Qs, x)
+
+        x = self.attn2(x=Qs, context=x, mask=mask, context_mask=mask) + Qs
+
         x = self.ff2(x) + x
         x = self.post_norm(x)
         
