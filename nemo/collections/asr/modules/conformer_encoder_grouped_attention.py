@@ -21,9 +21,7 @@ import torch.distributed
 import torch.nn as nn
 from omegaconf import DictConfig
 
-from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer #, CrossConformerLayer
-from nemo.collections.asr.parts.submodules.lucid_conformer import IntegrationConformerBlock, FunnelConformerBlock
-
+from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer
 from nemo.collections.asr.parts.submodules.multi_head_attention import PositionalEncoding, RelPositionalEncoding
 from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling, StackingSubsampling
 from nemo.collections.asr.parts.utils import adapter_utils
@@ -33,14 +31,12 @@ from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType
 
-from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
-
-__all__ = ['HierarchicalConformerEncoder']
+__all__ = ['ConformerEncoder']
 
 
 
 
-class HierarchicalConformerEncoder(NeuralModule, Exportable):
+class ConformerEncoder(NeuralModule, Exportable):
     """
     The encoder for ASR model of Conformer.
     Based on this paper:
@@ -137,19 +133,13 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
-        downsampling_type='pooling', #  'pooling' or 'conv'
-        n_repeats=3, # number of repeats of the cross-conformer layers
-        checkpoint_last_layer=False, # turn grad checkpointing off for last layer of the last iteration
-        checkpoint_every_n_layers=2,
-        gating_method= 'Sigmoid' # FiLM, Sigmoid or None (FiLM is showing very bad results)
+        group_attn_size=2, # 1 for standard attention
     ):
         super().__init__()
 
-        assert gating_method in ['FiLM', 'Sigmoid', 'None'], 'gating_method must be one of FiLM, Sigmoid or None'
-        self.gating_method = gating_method
-        
-        self.checkpoint_every_n_layers = checkpoint_every_n_layers
-        self.checkpoint_last_layer = checkpoint_last_layer
+        assert 1==2, 'NOT IMPLEMENTED YET'
+        assert group_attn_size < 3, 'grouped attention only implemented for groups of size 2 (currently)'
+        self.group_attn_size = group_attn_size
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -215,10 +205,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
         self.layers = nn.ModuleList()
-        
-        assert n_layers > 2, "Number of layers must be at least 3!"
-
-        for i in range(n_layers - 3):
+        for i in range(n_layers):
             layer = ConformerLayer(
                 d_model=d_model,
                 d_ff=d_ff,
@@ -233,44 +220,6 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             )
             self.layers.append(layer)
 
-        self.CrossConformerLayers = nn.ModuleList()
-     
-        layer = FunnelConformerBlock(
-            dim=d_model,
-            heads=n_heads,
-            dim_head=d_model // n_heads,
-            ff_mult=ff_expansion_factor,
-            conv_expansion_factor = 2,
-            conv_kernel_size=conv_kernel_size,
-            attn_dropout=dropout_att,
-            ff_dropout=dropout,
-            conv_dropout=dropout,
-        )
-        self.CrossConformerLayers.append(layer)
-
-        layer = IntegrationConformerBlock(
-            dim=d_model,
-            heads=n_heads,
-            dim_head=d_model // n_heads,
-            ff_mult=ff_expansion_factor,
-            conv_expansion_factor = 2,
-            conv_kernel_size=conv_kernel_size,
-            attn_dropout=dropout_att,
-            ff_dropout=dropout,
-            conv_dropout=dropout,
-            gating_method=self.gating_method
-        )
-        self.CrossConformerLayers.append(layer)
-        
-        self.downsampling_type = downsampling_type
-        if downsampling_type == 'pooling':
-            self.downsampling = nn.AvgPool1d(kernel_size=3, stride=3, count_include_pad=False) # don't count padding in average 
-        elif downsampling_type == 'conv': # NOT IMPLEMENTED YET
-            raise ValueError("Convolutional downsampling is not implemented yet!")
-            self.downsampling = nn.Conv1d(d_model, d_model, kernel_size=3, stride=3)
-        else:
-            raise ValueError("Not valid downsampling type: '{}'!".format(downsampling_type))
-
         if feat_out > 0 and feat_out != self._feat_out:
             self.out_proj = nn.Linear(self._feat_out, feat_out)
             self._feat_out = feat_out
@@ -279,10 +228,6 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             self._feat_out = d_model
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
-
-        self.n_repeats = n_repeats
-
-
 
     def set_max_audio_length(self, max_audio_length):
         """
@@ -302,12 +247,6 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
     def forward(self, audio_signal, length=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_for_export(audio_signal=audio_signal, length=length)
-
-    @staticmethod
-    def create_custom_forward(module): # for activation checkpointing allow passing dictionary as the argument to the module
-        def custom_forward(*args, **kwargs):
-            return module(*args, **kwargs)
-        return custom_forward
 
     @typecheck()
     def forward_for_export(self, audio_signal, length):
@@ -336,100 +275,19 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         pad_mask = self.make_pad_mask(max_audio_length, length)
         att_mask = pad_mask.unsqueeze(1).repeat([1, max_audio_length, 1])
         att_mask = torch.logical_and(att_mask, att_mask.transpose(1, 2))
-
-        if self.att_context_size[0] >= 0: 
-            att_mask = att_mask.triu(diagonal=-self.att_context_size[0]) 
+        if self.att_context_size[0] >= 0:
+            att_mask = att_mask.triu(diagonal=-self.att_context_size[0])
         if self.att_context_size[1] >= 0:
-            att_mask = att_mask.tril(diagonal=self.att_context_size[1]) 
-
+            att_mask = att_mask.tril(diagonal=self.att_context_size[1])
         att_mask = ~att_mask
 
         if self.use_pad_mask:
-            pad_mask = ~pad_mask 
+            pad_mask = ~pad_mask
         else:
             pad_mask = None
 
         for lth, layer in enumerate(self.layers):
-            if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:
-                audio_signal = checkpoint(self.create_custom_forward(layer), audio_signal, att_mask, pos_emb, pad_mask)
-            else:
-                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
-
-        pad_mask = ~pad_mask # invert mask (other attention function inverts it later so needs to be inverted here...)
-
-        for repeat in range(self.n_repeats):
-            # downsample the sequence length using average pooling or convolution
-            
-            if self.downsampling_type == 'pooling': 
-                pooled_audio_signal = self.downsampling(audio_signal.transpose(1, 2)).transpose(1, 2) # transpose so that the sequence length is the first dimension
-            # TODO: implement convolutional downsampling
-            
-            # we need to create new masks and pos_embs for the downsampled sequence length
-            max_downsampled_audio_length = pooled_audio_signal.size(1)
-            # calculate new length of each element (without padding) in the downsampled sequence
-            
-            downsampled_lengths = length.div(3, rounding_mode=None).ceil().int() # round up to make sure we don't cut off the last element or have a zero length
-
-
-            downsampled_pad_mask = self.make_pad_mask(max_downsampled_audio_length, downsampled_lengths)
-
-    
-            downsampled_x = checkpoint(self.create_custom_forward(self.CrossConformerLayers[0]), 
-                pooled_audio_signal, # Qs
-                audio_signal, # Ks
-                downsampled_pad_mask, # mask 
-                pad_mask # Context mask
-            )
-            
-            cat_downsampled_pad_mask = torch.empty(downsampled_pad_mask.shape[0], downsampled_pad_mask.shape[1]*3, dtype=torch.bool, device=downsampled_pad_mask.device)
-            cat_downsampled_x = torch.empty((downsampled_x.shape[0], downsampled_x.shape[1]*3, downsampled_x.shape[2]), device=downsampled_x.device)
-            padding_length = torch.tensor([0], dtype=torch.int32, device=downsampled_lengths.device) # padding items have a sequence length of 0
-            cat_downsampled_lengths = torch.cat([padding_length,  downsampled_lengths, padding_length], dim=0)
-
-            left_and_right_padding = torch.zeros_like(downsampled_x[0, :, :]).unsqueeze(0)
-            downsampled_x = torch.cat((left_and_right_padding, downsampled_x, left_and_right_padding), dim=0) 
-         
-         
-            # hopefully I can think of a nicer way to do this probably torch.gather
-            for i in range(1, downsampled_x.shape[0]-1): # skip the first and last element (the padding)
-                position = i - 1 
-                left_seq = downsampled_x[i-1, :cat_downsampled_lengths[i-1], :]
-                left_seq_padding = downsampled_x[i-1, cat_downsampled_lengths[i-1]:, :]
-                #
-                right_seq = downsampled_x[i+1, :cat_downsampled_lengths[i+1], :]
-                right_seq_padding = downsampled_x[i+1, cat_downsampled_lengths[i+1]:, :]
-                #
-                middle_seq = downsampled_x[i, :cat_downsampled_lengths[i], :]
-                middle_seq_padding = downsampled_x[i, cat_downsampled_lengths[i]:, :]
-                #
-                # now concatenate all these things (clean this all up later future me)
-                non_pad_seq = torch.cat((left_seq, middle_seq, right_seq), dim=0)
-                pad_seq = torch.cat((left_seq_padding, middle_seq_padding, right_seq_padding), dim=0)
-
-                full_seq = torch.cat((non_pad_seq, pad_seq), dim=0)
-                #del pad_seq, left_seq, left_seq_padding, right_seq, right_seq_padding, middle_seq, middle_seq_padding
-
-                cur_pad_mask = torch.zeros(cat_downsampled_x[position, :, :].shape[0], dtype=torch.bool, device=downsampled_x.device)
-                cur_pad_mask[:non_pad_seq.shape[0]] = True
-
-                cat_downsampled_x[position, :, :] = full_seq.unsqueeze(0)
-                cat_downsampled_pad_mask[position, :] = cur_pad_mask.reshape(-1)
-            
-            if repeat == self.n_repeats - 1 and self.checkpoint_last_layer == False:
-                audio_signal = self.CrossConformerLayers[1](
-                    Qs=audio_signal,
-                    KVs=cat_downsampled_x,
-                    mask=pad_mask,
-                    context_mask=cat_downsampled_pad_mask
-                )
-            else:
-                audio_signal = checkpoint(self.create_custom_forward(self.CrossConformerLayers[1]), 
-                    audio_signal, # Qs
-                    cat_downsampled_x, # KVs
-                    pad_mask,  # mask
-                    cat_downsampled_pad_mask # context_mask
-                )
-
+            audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
@@ -453,7 +311,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
     def make_pad_mask(self, max_audio_length, seq_lens):
         """Make masking for padding."""
-        mask = self.seq_range[:max_audio_length].expand(seq_lens.size(0), -1) < seq_lens.unsqueeze(-1) # boolean operater
+        mask = self.seq_range[:max_audio_length].expand(seq_lens.size(0), -1) < seq_lens.unsqueeze(-1)
         return mask
 
     def enable_pad_mask(self, on=True):
@@ -463,7 +321,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         return mask
 
 
-class HConformerEncoderAdapter(HierarchicalConformerEncoder, adapter_mixins.AdapterModuleMixin):
+class ConformerEncoderAdapter(ConformerEncoder, adapter_mixins.AdapterModuleMixin):
 
     # Higher level forwarding
     def add_adapter(self, name: str, cfg: dict):
@@ -495,5 +353,5 @@ class HConformerEncoderAdapter(HierarchicalConformerEncoder, adapter_mixins.Adap
 """
 Register any additional information
 """
-if adapter_mixins.get_registered_adapter(HierarchicalConformerEncoder) is None:
-    adapter_mixins.register_adapter(base_class=HierarchicalConformerEncoder, adapter_class=HConformerEncoderAdapter)
+if adapter_mixins.get_registered_adapter(ConformerEncoder) is None:
+    adapter_mixins.register_adapter(base_class=ConformerEncoder, adapter_class=ConformerEncoderAdapter)

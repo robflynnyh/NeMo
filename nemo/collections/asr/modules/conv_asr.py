@@ -526,12 +526,18 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         vocabulary=None, 
         remove_ctx=False, 
         gating=False,
+        reproject_type='conv', # linear, conv
         auxilary_training=False # train reprojection layer using word embedding task
     ):
         super().__init__()
 
+        assert auxilary_training == False, "Not implemented yet"
+        assert reproject_type in ['linear', 'conv'], "reproject_type should be either 'linear' or 'conv'"
+        
+        self.reproject_type = reproject_type
 
         self.auxilary_training = auxilary_training
+
         if self.auxilary_training == True:
             self.left_word_prediction = torch.nn.Linear(
                 feat_in,
@@ -566,7 +572,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         )
 
         self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim. Change to linear !
-            torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) 
+            torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) if reproject_type == 'conv' else torch.nn.Linear(self._num_classes, self._feat_in, bias=True)
         )
 
         self.gating = gating
@@ -604,7 +610,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         '''
         Projects the decoder output back to the acoustic models hidden dimension for self-conditioning.
         '''
-        return self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2)
+        return self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2) if self.reproject_type == 'conv' else self.reprojection_layers(decoder_output)
       
 
     def integrate_projections(self, encoder_out, proj1):

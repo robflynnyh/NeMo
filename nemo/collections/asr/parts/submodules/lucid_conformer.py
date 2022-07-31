@@ -1,7 +1,5 @@
 '''
-Most of this is from lucidrain's GitHub repository: https://github.com/lucidrains/conformer
-Apart from Cross-Conformer i.e funnel and integration which, adapt from the original code, 
-and use xtransformers library for the attention because it has a ton of extra features that may be useful in the future.
+Heavily relies on code from: https://github.com/lucidrains/conformer
 '''
 
 import torch
@@ -171,6 +169,85 @@ class ConformerConvModule(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class GroupedConformerBlock(nn.Module):
+    '''
+    Uses idea from: https://arxiv.org/abs/2109.01163
+    '''
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_head = 64,
+        heads = 8,
+        ff_mult = 4,
+        conv_expansion_factor = 2,
+        conv_kernel_size = 31,
+        attn_dropout = 0.,
+        ff_dropout = 0.,
+        conv_dropout = 0.,
+        grouped_attn_size = 2,
+    ):
+        super().__init__()
+        self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
+        
+        self.grouped_attn_size = grouped_attn_size
+
+        self.attn = xAttention( 
+            dim=dim * self.grouped_attn_size,
+            dim_head=dim_head,
+            heads=heads,
+            dropout=attn_dropout,
+            return_intermediates=False
+        )
+
+        self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
+        self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
+
+        self.attn = PreNorm(dim * self.grouped_attn_size, self.attn)
+        self.ff1 = Scale(0.5, PreNorm(dim, self.ff1))
+        self.ff2 = Scale(0.5, PreNorm(dim, self.ff2))
+
+        self.post_norm = nn.LayerNorm(dim)
+
+    def group_x(self, x, lengths):
+        '''
+        Reshape x into x / attn_groups
+        if x is not divisible by attn_groups then padding must be added
+        additionally a new mask needs to be created for the new sequence length
+        x: (b, n, c)
+        lengths: length of each element in the batch excluding padding (used to create the new mask)
+        '''
+        b, n, c = x.shape
+        attn_groups = self.grouped_attn_size
+        padding_to_add = (attn_groups - n % attn_groups) % attn_groups # nice job co-pilot
+        grouped_x = torch.cat([x, torch.zeros((b, padding_to_add, c), device = x.device)], dim = 1)
+        grouped_x = grouped_x.view(b, torch.div(grouped_x.shape[1], attn_groups).int(), attn_groups * c)
+
+        new_mask = torch.zeros((b, grouped_x.shape[1]), device = x.device, dtype = torch.bool)
+        new_mask[:, :torch.div(lengths, attn_groups).ceil().int()] = 1
+        return grouped_x, new_mask
+
+
+    def ungroup_x(self, x, seq_len):
+        '''
+        Reshape x to be equal to previous shape, slice to the correct sequence length to account for any added padding
+        x: (b, n, c)
+        seq_len: original sequence length of x (including padding)
+        '''
+        return x.view(x.shape[0], -1, x.shape[2] * self.grouped_attn_size)[:, :seq_len, :]
+
+    def forward(self, x, lengths, mask = None):
+        x = self.ff1(x) + x
+
+        grouped_x, grouped_mask = self.group_x(x, lengths)
+        x = self.ungroup_x(self.attn(grouped_x, mask = grouped_mask), seq_len=x.shape[1]) + x
+
+        x = self.conv(x) + x
+        x = self.ff2(x) + x
+        x = self.post_norm(x)
+        return x
+
 
 # Conformer Block
 
