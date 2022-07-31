@@ -1,7 +1,7 @@
 '''
 Most of this is from lucidrain's GitHub repository: https://github.com/lucidrains/conformer
 Apart from Cross-Conformer i.e funnel and integration which, adapt from the original code, 
-and use xtransformers library for the cross-attention
+and use xtransformers library for the attention because it has a ton of extra features that may be useful in the future.
 '''
 
 import torch
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from nemo.collections.asr.parts.submodules.x_transformers_local import CrossAttender
+from nemo.collections.asr.parts.submodules.x_transformers_local import CrossAttender, Attention as xAttention
 
 
 # helper functions
@@ -224,20 +224,21 @@ class FunnelConformerBlock(nn.Module):
         conv_kernel_size = 31,
         attn_dropout = 0.,
         ff_dropout = 0.,
-        conv_dropout = 0.
+        conv_dropout = 0.,
+        residual = False
     ):
         super().__init__()
         self.ff1Q = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
         self.ff1KV = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
-        #self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
-        self.attn = CrossAttender( # TODO: convert attention in this class to handle cross attention 
+        self.residual = residual
+
+        self.attn = xAttention( 
             dim=dim,
             dim_head=dim_head,
             heads=heads,
             dropout=attn_dropout,
-            depth=1,
-            rel_pos_bias=False # convolutions help handle positional information
+            return_intermediates=False
         )
 
         self.convQ = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
@@ -245,7 +246,7 @@ class FunnelConformerBlock(nn.Module):
 
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
-        #self.attn = PreNorm(dim, self.attn) cross attender layer already handles pre-normalization
+        self.attn = PreNorm(dim, self.attn) 
 
         self.ff1Q = Scale(0.5, PreNorm(dim, self.ff1Q))
         self.ff1KV = Scale(0.5, PreNorm(dim, self.ff1KV))
@@ -262,7 +263,10 @@ class FunnelConformerBlock(nn.Module):
         Qs = self.convQ(Qs) + Qs
         KVs = self.convKV(KVs) + KVs
 
-        x = self.attn(x=Qs, context=KVs, mask=mask, context_mask=context_mask) + Qs # possibly don't add the residual here
+        x = self.attn(x=Qs, context=KVs, mask=mask, context_mask=context_mask) 
+        if self.residual:
+            x = x + Qs
+            
         x = self.ff2(x) + x
         x = self.post_norm(x)
         
@@ -294,7 +298,7 @@ class IntegrationConformerBlock(nn.Module):
         self.gating_method = gating_method
         assert gating_method in ['FiLM', 'Conv', 'None'], 'Gating method must be one of FiLM, Conv, or None'
         
-        self.gating_fn = lambda q, context: context
+        self.gating_fn = lambda q, context: context # i.e. no gating
         if gating_method == 'FiLM':
             self.init_FiLM(d_model=dim)
             self.gating_fn = self.apply_FiLM
@@ -303,22 +307,20 @@ class IntegrationConformerBlock(nn.Module):
             self.gating_fn = self.apply_Conv
 
         #self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
-        self.attn1 = CrossAttender( # TODO: convert attention in this class to handle cross attention 
+        self.attn1 = xAttention( 
             dim=dim,
             dim_head=dim_head,
             heads=heads,
             dropout=attn_dropout,
-            depth=1,
-            rel_pos_bias=False # convolutions help handle positional information
+            return_intermediates=False
         )
 
-        self.attn2 = CrossAttender( 
+        self.attn2 = xAttention( 
             dim=dim,
             dim_head=dim_head,
             heads=heads,
             dropout=attn_dropout,
-            depth=1,
-            rel_pos_bias=False # convolutions help handle positional information
+            return_intermediates=False
         )
 
         self.convQ = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
@@ -326,7 +328,8 @@ class IntegrationConformerBlock(nn.Module):
 
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
-        #self.attn = PreNorm(dim, self.attn) cross attender layer already handles pre-normalization
+        self.attn1 = PreNorm(dim, self.attn1)
+        self.attn2 = PreNorm(dim, self.attn2)
 
         self.ff1Q = Scale(0.5, PreNorm(dim, self.ff1Q))
         self.ff1KV = Scale(0.5, PreNorm(dim, self.ff1KV))
@@ -369,7 +372,7 @@ class IntegrationConformerBlock(nn.Module):
         x = self.attn1(x=Qs, context=KVs, mask=mask, context_mask=context_mask) + Qs
         x = self.gating_fn(Qs, x)
 
-        x = self.attn2(x=Qs, context=x, mask=mask, context_mask=mask) + Qs
+        x = self.attn2(x=Qs, context=x, mask=mask, context_mask=mask) + Qs # x.shape -> q.shape because of previous attention layer so we use the Q mask for both inputs here
 
         x = self.ff2(x) + x
         x = self.post_norm(x)

@@ -520,7 +520,8 @@ class Attention(nn.Module):
         shared_kv = False,
         value_dim_head = None,
         scale_log_seq = False,
-        scale_log_seq_base = 512
+        scale_log_seq_base = 512,
+        return_intermediates = True
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -532,6 +533,8 @@ class Attention(nn.Module):
         value_dim_head = default(value_dim_head, dim_head)
         q_dim = k_dim = dim_head * heads
         v_dim = out_dim = value_dim_head * heads
+
+        self.return_intermediates = return_intermediates
 
         self.one_kv_head = one_kv_head
         if one_kv_head:
@@ -674,7 +677,8 @@ class Attention(nn.Module):
         if exists(prev_attn):
             dots = dots + prev_attn
 
-        pre_softmax_attn = dots.clone()
+        if self.return_intermediates:
+            pre_softmax_attn = dots.clone()
 
         if talking_heads:
             dots = self.pre_softmax_talking_heads(dots)
@@ -724,7 +728,9 @@ class Attention(nn.Module):
             dots = dots * log_seq_scale
 
         attn = self.attn_fn(dots, dim = -1)
-        post_softmax_attn = attn.clone()
+
+        if self.return_intermediates:
+            post_softmax_attn = attn.clone()
 
         attn = self.dropout(attn)
 
@@ -742,12 +748,14 @@ class Attention(nn.Module):
             gates = self.to_v_gate(x)
             out = out * gates.sigmoid()
 
-        intermediates = Intermediates(
-            pre_softmax_attn = pre_softmax_attn,
-            post_softmax_attn = post_softmax_attn
-        )
-
-        return self.to_out(out), intermediates
+        if self.return_intermediates:
+            intermediates = Intermediates(
+                pre_softmax_attn = pre_softmax_attn,
+                post_softmax_attn = post_softmax_attn
+            )
+            return self.to_out(out), intermediates
+        else:
+            return self.to_out(out)
 
 class AttentionLayers(nn.Module):
     def __init__(
