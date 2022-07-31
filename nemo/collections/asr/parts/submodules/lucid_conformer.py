@@ -289,22 +289,23 @@ class IntegrationConformerBlock(nn.Module):
         attn_dropout = 0.,
         ff_dropout = 0.,
         conv_dropout = 0.,
-        gating_method = 'FiLM'
+        gating_method = 'Sigmoid'
     ):
         super().__init__()
         self.ff1Q = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
         self.ff1KV = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
         
         self.gating_method = gating_method
-        assert gating_method in ['FiLM', 'Conv', 'None'], 'Gating method must be one of FiLM, Conv, or None'
+        assert gating_method in ['FiLM', 'Sigmoid', 'None'], 'Gating method must be one of FiLM, Conv, or None'
         
         self.gating_fn = lambda q, context: context # i.e. no gating
-        if gating_method == 'FiLM':
+        if gating_method == 'FiLM': # doesn't work well as is
             self.init_FiLM(d_model=dim)
             self.gating_fn = self.apply_FiLM
-        elif gating_method == 'Conv':
-            self.init_Conv(d_model=dim)
-            self.gating_fn = self.apply_Conv
+
+        elif gating_method == 'Sigmoid':
+            self.init_sigmoid_gating(d_model=dim)
+            self.gating_fn = self.apply_sigmoid_gating
 
         #self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
         self.attn1 = xAttention( 

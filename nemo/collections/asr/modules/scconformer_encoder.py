@@ -32,6 +32,7 @@ from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType, LogprobsType
 
 from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
+from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
 
 __all__ = ['SelfConditionedConformerEncoder']
 
@@ -138,8 +139,11 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
+        checkpoint_every_n_layers=0,
     ):
         super().__init__()
+
+        self.checkpoint_every_n_layers = checkpoint_every_n_layers
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -245,6 +249,12 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
             self.register_buffer('seq_range', seq_range, persistent=False)
         self.pos_enc.extend_pe(max_audio_length, device)
 
+    @staticmethod
+    def create_custom_forward(module): # for activation checkpointing allow passing dictionary as the argument to the module
+        def custom_forward(*args, **kwargs):
+            return module(*args, **kwargs)
+        return custom_forward
+
     @typecheck()
     def forward(self, audio_signal, decoder, length=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
@@ -290,7 +300,11 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
 
         iterim_posteriors = []
         for lth, layer in enumerate(self.layers):
-            audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+            if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:
+                audio_signal = checkpoint(self.create_custom_forward(layer), audio_signal, att_mask, pos_emb, pad_mask)
+            else:
+                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+                
             if lth != len(self.layers) - 1:
                 iterim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
                 iterim_post = torch.nn.functional.softmax(iterim_logits, dim=-1)

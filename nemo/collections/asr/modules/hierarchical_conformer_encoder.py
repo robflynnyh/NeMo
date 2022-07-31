@@ -141,7 +141,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         n_repeats=3, # number of repeats of the cross-conformer layers
         checkpoint_last_layer=False, # turn grad checkpointing off for last layer of the last iteration
         checkpoint_every_n_layers=2,
-        gating_method= 'FiLM' # FiLM, Sigmoid or None
+        gating_method= 'Sigmoid' # FiLM, Sigmoid or None (FiLM is showing very bad results)
     ):
         super().__init__()
 
