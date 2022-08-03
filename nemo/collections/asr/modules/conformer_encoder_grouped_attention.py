@@ -31,12 +31,18 @@ from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType
 
-__all__ = ['ConformerEncoder']
+from nemo.collections.asr.parts.submodules.x_transformers_local import RelativePositionBias, RotaryEmbedding
+
+from nemo.collections.asr.parts.submodules.lucid_conformer import GroupedConformerBlock
+
+from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
+
+__all__ = ['GroupedConformerEncoder']
 
 
 
 
-class ConformerEncoder(NeuralModule, Exportable):
+class GroupedConformerEncoder(NeuralModule, Exportable):
     """
     The encoder for ASR model of Conformer.
     Based on this paper:
@@ -134,21 +140,22 @@ class ConformerEncoder(NeuralModule, Exportable):
         dropout_emb=0.1,
         dropout_att=0.0,
         group_attn_size=2, # 1 for standard attention
+        conv_expansion_factor=1,
+        grouping_constant_dim=True,
+        checkpoint_every_n_layers=2,
+        experimental_settings=True
     ):
         super().__init__()
 
-        assert 1==2, 'NOT IMPLEMENTED YET'
-        assert group_attn_size < 3, 'grouped attention only implemented for groups of size 2 (currently)'
         self.group_attn_size = group_attn_size
+        self.checkpoint_every_n_layers = checkpoint_every_n_layers
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
         self._feat_in = feat_in
         self.scale = math.sqrt(self.d_model)
-        if att_context_size:
-            self.att_context_size = att_context_size
-        else:
-            self.att_context_size = [-1, -1]
+
+        self.grouping_constant_dim = grouping_constant_dim
 
         if xscaling:
             self.xscale = math.sqrt(d_model)
@@ -176,47 +183,44 @@ class ConformerEncoder(NeuralModule, Exportable):
 
         self._feat_out = d_model
 
-        if not untie_biases and self_attention_model == "rel_pos":
-            d_head = d_model // n_heads
-            pos_bias_u = nn.Parameter(torch.Tensor(n_heads, d_head))
-            pos_bias_v = nn.Parameter(torch.Tensor(n_heads, d_head))
-            nn.init.zeros_(pos_bias_u)
-            nn.init.zeros_(pos_bias_v)
-        else:
-            pos_bias_u = None
-            pos_bias_v = None
+ 
 
         self.pos_emb_max_len = pos_emb_max_len
+        self.pos_type = self_attention_model
         if self_attention_model == "rel_pos":
-            self.pos_enc = RelPositionalEncoding(
-                d_model=d_model,
-                dropout_rate=dropout,
-                max_len=pos_emb_max_len,
-                xscale=self.xscale,
-                dropout_rate_emb=dropout_emb,
+            self.pos_enc = RelativePositionBias(
+                scale = self.xscale,
+                causal = False,
+                max_distance = pos_emb_max_len,
+                num_buckets = pos_emb_max_len // 4,
+                heads = n_heads
             )
+        elif self_attention_model == "rotary":
+            dim_head = (d_model * group_attn_size) // n_heads if self.constant_dim == False else d_model // n_heads
+            rotary_emb_dim = max(dim_head // 2, 32)
+            self.pos_enc = RotaryEmbedding(rotary_emb_dim)
+            
         elif self_attention_model == "abs_pos":
-            pos_bias_u = None
-            pos_bias_v = None
-            self.pos_enc = PositionalEncoding(
-                d_model=d_model, dropout_rate=dropout, max_len=pos_emb_max_len, xscale=self.xscale
-            )
+            raise NotImplementedError
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
+
         self.layers = nn.ModuleList()
         for i in range(n_layers):
-            layer = ConformerLayer(
-                d_model=d_model,
-                d_ff=d_ff,
-                self_attention_model=self_attention_model,
-                n_heads=n_heads,
+            layer = GroupedConformerBlock(
+                dim = d_model,
+                heads = n_heads,
+                ff_mult=ff_expansion_factor,
+                conv_expansion_factor = conv_expansion_factor,
                 conv_kernel_size=conv_kernel_size,
-                conv_norm_type=conv_norm_type,
-                dropout=dropout,
-                dropout_att=dropout_att,
-                pos_bias_u=pos_bias_u,
-                pos_bias_v=pos_bias_v,
+                attn_dropout=dropout_att,
+                ff_dropout=dropout,
+                conv_dropout=dropout, 
+                grouped_attn_size=self.group_attn_size,
+                pad_mask_fn=self.make_pad_mask,
+                constant_dim=self.grouping_constant_dim,
+                experimental_settings=experimental_settings
             )
             self.layers.append(layer)
 
@@ -241,7 +245,13 @@ class ConformerEncoder(NeuralModule, Exportable):
             self.seq_range = seq_range
         else:
             self.register_buffer('seq_range', seq_range, persistent=False)
-        self.pos_enc.extend_pe(max_audio_length, device)
+        #self.pos_enc.extend_pe(max_audio_length, device)
+
+    @staticmethod
+    def create_custom_forward(module): # for activation checkpointing 
+        def custom_forward(*args, **kwargs):
+            return module(*args, **kwargs)
+        return custom_forward
 
     @typecheck()
     def forward(self, audio_signal, length=None):
@@ -267,27 +277,24 @@ class ConformerEncoder(NeuralModule, Exportable):
         else:
             audio_signal, length = self.pre_encode(audio_signal, length)
 
-        audio_signal, pos_emb = self.pos_enc(audio_signal)
-        # adjust size
         max_audio_length = audio_signal.size(1)
         # Create the self-attention and padding masks
 
-        pad_mask = self.make_pad_mask(max_audio_length, length)
-        att_mask = pad_mask.unsqueeze(1).repeat([1, max_audio_length, 1])
-        att_mask = torch.logical_and(att_mask, att_mask.transpose(1, 2))
-        if self.att_context_size[0] >= 0:
-            att_mask = att_mask.triu(diagonal=-self.att_context_size[0])
-        if self.att_context_size[1] >= 0:
-            att_mask = att_mask.tril(diagonal=self.att_context_size[1])
-        att_mask = ~att_mask
-
-        if self.use_pad_mask:
-            pad_mask = ~pad_mask
-        else:
-            pad_mask = None
+        pad_mask=None # initally set to None, that gets created in the first layer
+        rel_pos = self.pos_enc if self.pos_type == "rel_pos" else None
+        rotary_pos_emb = self.pos_enc if self.pos_type == "rotary" else None
 
         for lth, layer in enumerate(self.layers):
-            audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+            if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:
+                audio_signal, pad_mask = checkpoint(self.create_custom_forward(layer), audio_signal, length, pad_mask, rel_pos, rotary_pos_emb)
+            else:
+                audio_signal, pad_mask = layer(
+                    x=audio_signal,
+                    lengths=length,
+                    mask=pad_mask,
+                    rel_pos=rel_pos,
+                    rotary_pos_emb=rotary_pos_emb,
+                )
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
@@ -321,7 +328,7 @@ class ConformerEncoder(NeuralModule, Exportable):
         return mask
 
 
-class ConformerEncoderAdapter(ConformerEncoder, adapter_mixins.AdapterModuleMixin):
+class GroupedConformerEncoderAdapter(GroupedConformerEncoder, adapter_mixins.AdapterModuleMixin):
 
     # Higher level forwarding
     def add_adapter(self, name: str, cfg: dict):
@@ -353,5 +360,5 @@ class ConformerEncoderAdapter(ConformerEncoder, adapter_mixins.AdapterModuleMixi
 """
 Register any additional information
 """
-if adapter_mixins.get_registered_adapter(ConformerEncoder) is None:
-    adapter_mixins.register_adapter(base_class=ConformerEncoder, adapter_class=ConformerEncoderAdapter)
+if adapter_mixins.get_registered_adapter(GroupedConformerEncoder) is None:
+    adapter_mixins.register_adapter(base_class=GroupedConformerEncoder, adapter_class=GroupedConformerEncoderAdapter)

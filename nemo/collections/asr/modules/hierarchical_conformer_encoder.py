@@ -34,6 +34,7 @@ from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType
 
 from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
+from nemo.collections.asr.parts.submodules.x_transformers_local import RelativePositionBias
 
 __all__ = ['HierarchicalConformerEncoder']
 
@@ -141,7 +142,8 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         n_repeats=3, # number of repeats of the cross-conformer layers
         checkpoint_last_layer=False, # turn grad checkpointing off for last layer of the last iteration
         checkpoint_every_n_layers=2,
-        gating_method= 'Sigmoid' # FiLM, Sigmoid or None (FiLM is showing very bad results)
+        gating_method= 'Sigmoid', # FiLM, Sigmoid or None (FiLM is showing very bad results)
+        freeze_initial_encoder=False,
     ):
         super().__init__()
 
@@ -214,6 +216,17 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
+        # from other module to change all this later
+      
+        self.rel_pos = RelativePositionBias(
+            scale = self.xscale,
+            causal = False,
+            max_distance = pos_emb_max_len,
+            num_buckets = pos_emb_max_len // 4,
+            heads = n_heads
+        )
+    
+
         self.layers = nn.ModuleList()
         
         assert n_layers > 2, "Number of layers must be at least 3!"
@@ -232,6 +245,13 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
                 pos_bias_v=pos_bias_v,
             )
             self.layers.append(layer)
+
+        if freeze_initial_encoder:
+            # freeze initial layers (use for adapting trained model to Hconformer attention)
+            print("Freezing initial encoder layers")
+            for layer in self.layers:
+                for param in layer.parameters():
+                    param.grad = None # freeze all gradients stops optimizer from updating
 
         self.CrossConformerLayers = nn.ModuleList()
      
@@ -263,6 +283,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         self.CrossConformerLayers.append(layer)
         
         self.downsampling_type = downsampling_type
+
         if downsampling_type == 'pooling':
             self.downsampling = nn.AvgPool1d(kernel_size=3, stride=3, count_include_pad=False) # don't count padding in average 
         elif downsampling_type == 'conv': # NOT IMPLEMENTED YET
@@ -358,8 +379,9 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         pad_mask = ~pad_mask # invert mask (other attention function inverts it later so needs to be inverted here...)
 
         for repeat in range(self.n_repeats):
+
+            #''' NONE OF THIS IS WORKING WHY
             # downsample the sequence length using average pooling or convolution
-            
             if self.downsampling_type == 'pooling': 
                 pooled_audio_signal = self.downsampling(audio_signal.transpose(1, 2)).transpose(1, 2) # transpose so that the sequence length is the first dimension
             # TODO: implement convolutional downsampling
@@ -369,18 +391,14 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             # calculate new length of each element (without padding) in the downsampled sequence
             
             downsampled_lengths = length.div(3, rounding_mode=None).ceil().int() # round up to make sure we don't cut off the last element or have a zero length
-
-
             downsampled_pad_mask = self.make_pad_mask(max_downsampled_audio_length, downsampled_lengths)
 
-    
             downsampled_x = checkpoint(self.create_custom_forward(self.CrossConformerLayers[0]), 
                 pooled_audio_signal, # Qs
                 audio_signal, # Ks
                 downsampled_pad_mask, # mask 
                 pad_mask # Context mask
             )
-            
             cat_downsampled_pad_mask = torch.empty(downsampled_pad_mask.shape[0], downsampled_pad_mask.shape[1]*3, dtype=torch.bool, device=downsampled_pad_mask.device)
             cat_downsampled_x = torch.empty((downsampled_x.shape[0], downsampled_x.shape[1]*3, downsampled_x.shape[2]), device=downsampled_x.device)
             padding_length = torch.tensor([0], dtype=torch.int32, device=downsampled_lengths.device) # padding items have a sequence length of 0
@@ -401,6 +419,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
                 #
                 middle_seq = downsampled_x[i, :cat_downsampled_lengths[i], :]
                 middle_seq_padding = downsampled_x[i, cat_downsampled_lengths[i]:, :]
+                
                 #
                 # now concatenate all these things (clean this all up later future me)
                 non_pad_seq = torch.cat((left_seq, middle_seq, right_seq), dim=0)
@@ -414,20 +433,44 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
                 cat_downsampled_x[position, :, :] = full_seq.unsqueeze(0)
                 cat_downsampled_pad_mask[position, :] = cur_pad_mask.reshape(-1)
+            #    NONE OF THIS IS WORKING WHY
+            #'''
+    
+            #cat_downsampled_x = torch.cat((audio_signal, torch.zeros_like(audio_signal[0, :, :]).unsqueeze(0)), dim=0).roll(shifts=1, dims=0)[:-1]
+            #cat_downsampled_pad_mask = torch.cat((pad_mask, torch.zeros_like(pad_mask[0]).bool().unsqueeze(0)), dim=0).roll(shifts=1, dims=0)[:-1]
+            # the above two lines of code do the following:
+            # 1. concatenate the audio signal with a zero vector the size of 1 element of the audio signal (along the sequence dimension)
+            # 2. roll the audio signal along the sequence dimension by 1 element (so that the first element is now the second element)
+            # 3. remove the last element 
+            # 4. repeat the process for the pad mask
+            # Why?
+            # so the audio signal is lined up with a sequence that is shifted by 1 element to the right
+            # Why?
+            # Because the following cross-attention layer with apply attention between the audio signal and the shifted sequence
+            # Why?
+            # So that each element can attent to the previous element in the sequence
             
+            # randomly permute both cat_downsampled_x and cat_downsampled_pad_mask
+            # Why?
+            # to de-bug the cross-attention layer
+
+            
+
             if repeat == self.n_repeats - 1 and self.checkpoint_last_layer == False:
                 audio_signal = self.CrossConformerLayers[1](
                     Qs=audio_signal,
                     KVs=cat_downsampled_x,
                     mask=pad_mask,
-                    context_mask=cat_downsampled_pad_mask
+                    context_mask=cat_downsampled_pad_mask,
+                    rel_pos=self.rel_pos
                 )
             else:
                 audio_signal = checkpoint(self.create_custom_forward(self.CrossConformerLayers[1]), 
                     audio_signal, # Qs
                     cat_downsampled_x, # KVs
                     pad_mask,  # mask
-                    cat_downsampled_pad_mask # context_mask
+                    cat_downsampled_pad_mask, # context_mask
+                    self.rel_pos
                 )
 
 

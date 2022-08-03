@@ -533,6 +533,8 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
 
         assert auxilary_training == False, "Not implemented yet"
         assert reproject_type in ['linear', 'conv'], "reproject_type should be either 'linear' or 'conv'"
+        if auxilary_training == True:
+            assert reproject_type == 'linear', "reproject_type should be 'linear' when auxilary_training is True"
         
         self.reproject_type = reproject_type
 

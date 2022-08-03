@@ -172,60 +172,92 @@ class ConformerConvModule(nn.Module):
 
 class GroupedConformerBlock(nn.Module):
     '''
-    Uses idea from: https://arxiv.org/abs/2109.01163
+    Uses idea grouped attention idea
+    from: https://arxiv.org/abs/2109.01163
     '''
     def __init__(
         self,
         *,
         dim,
-        dim_head = 64,
         heads = 8,
         ff_mult = 4,
-        conv_expansion_factor = 2,
+        conv_expansion_factor = 1,
         conv_kernel_size = 31,
         attn_dropout = 0.,
         ff_dropout = 0.,
         conv_dropout = 0.,
         grouped_attn_size = 2,
+        pad_mask_fn = None, # function to create padding mask from list of lengths and sequence length i.e pad_mask_fn(lengths, seq_len) -> mask
+        constant_dim = True, # if true uses projection layers to keep the dimension constant
+        experimental_settings=False
     ):
         super().__init__()
         self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
         
-        self.grouped_attn_size = grouped_attn_size
+        self.constant_dim = constant_dim
+        self.pad_mask_fn = pad_mask_fn
 
-        self.attn = xAttention( 
-            dim=dim * self.grouped_attn_size,
-            dim_head=dim_head,
-            heads=heads,
-            dropout=attn_dropout,
-            return_intermediates=False
-        )
+        assert exists(pad_mask_fn), 'pad_mask_fn must be defined'
+
+        self.grouped_attn_size = grouped_attn_size
+        
+        dim_size = dim * self.grouped_attn_size #if self.constant_dim == False else dim
+        dim_head = dim_size // heads if self.constant_dim == False else dim // heads
+
+        if experimental_settings == False:
+            self.attn = xAttention( 
+                dim=dim_size,
+                dim_head=dim_head,
+                heads=heads,
+                dropout=attn_dropout,
+                return_intermediates=False
+            )
+        else:
+            self.attn = xAttention( # possibly also add residual attention
+                dim=dim_size,
+                dim_head=dim_head,
+                heads=heads,
+                dropout=attn_dropout,
+                return_intermediates=False,
+                num_mem_kv=32,
+                talking_heads = True, 
+            )   #         sparse_topk=8, # maybe not for audio (or larger)
+
 
         self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
-        self.attn = PreNorm(dim * self.grouped_attn_size, self.attn)
+
+        self.attn = PreNorm(dim_size, self.attn)
         self.ff1 = Scale(0.5, PreNorm(dim, self.ff1))
         self.ff2 = Scale(0.5, PreNorm(dim, self.ff2))
 
         self.post_norm = nn.LayerNorm(dim)
 
-    def group_x(self, x, lengths):
+    def group_x(self, x, lengths, mask):
         '''
         Reshape x into x / attn_groups
         if x is not divisible by attn_groups then padding must be added
         additionally a new mask needs to be created for the new sequence length
         x: (b, n, c)
         lengths: length of each element in the batch excluding padding (used to create the new mask)
+        mask: this is a cache of the mask to prevent recomputation for each layer, first layer in each mini-batch mask == None so it is computed
         '''
+        if self.grouped_attn_size == 1:
+            return x, mask
+
         b, n, c = x.shape
         attn_groups = self.grouped_attn_size
-        padding_to_add = (attn_groups - n % attn_groups) % attn_groups # nice job co-pilot
+        padding_to_add = (attn_groups - n % attn_groups) % attn_groups 
         grouped_x = torch.cat([x, torch.zeros((b, padding_to_add, c), device = x.device)], dim = 1)
-        grouped_x = grouped_x.view(b, torch.div(grouped_x.shape[1], attn_groups).int(), attn_groups * c)
+        grouped_x = grouped_x.reshape(b, torch.div(grouped_x.shape[1], attn_groups).int(), attn_groups * c)
 
-        new_mask = torch.zeros((b, grouped_x.shape[1]), device = x.device, dtype = torch.bool)
-        new_mask[:, :torch.div(lengths, attn_groups).ceil().int()] = 1
+        if exists(mask):
+            new_mask = mask
+        else:
+            new_lengths = torch.div(lengths, attn_groups).ceil().long()
+            new_mask = self.pad_mask_fn(grouped_x.shape[1], new_lengths)
+
         return grouped_x, new_mask
 
 
@@ -235,18 +267,31 @@ class GroupedConformerBlock(nn.Module):
         x: (b, n, c)
         seq_len: original sequence length of x (including padding)
         '''
-        return x.view(x.shape[0], -1, x.shape[2] * self.grouped_attn_size)[:, :seq_len, :]
+        if self.grouped_attn_size == 1:
+            return x
 
-    def forward(self, x, lengths, mask = None):
+        return x.reshape(x.shape[0], -1, x.shape[2] // self.grouped_attn_size)[:, :seq_len, :]
+
+    def forward(self, x, lengths, mask=None, rel_pos=None, rotary_pos_emb=None):
         x = self.ff1(x) + x
 
-        grouped_x, grouped_mask = self.group_x(x, lengths)
-        x = self.ungroup_x(self.attn(grouped_x, mask = grouped_mask), seq_len=x.shape[1]) + x
+        #print(x.shape, 'x')
+        grouped_x, grouped_mask = self.group_x(x, lengths, mask)
+        #print(grouped_x.shape, 'grouped_x')
+
+        x = self.ungroup_x(self.attn(
+            grouped_x, 
+            mask = grouped_mask,
+            rel_pos = rel_pos,
+            rotary_pos_emb = rotary_pos_emb
+            ), seq_len=x.shape[1]) + x
+
+        #print(x.shape, 'x')
 
         x = self.conv(x) + x
         x = self.ff2(x) + x
         x = self.post_norm(x)
-        return x
+        return x, grouped_mask
 
 
 # Conformer Block
@@ -376,7 +421,7 @@ class IntegrationConformerBlock(nn.Module):
         assert gating_method in ['FiLM', 'Sigmoid', 'None'], 'Gating method must be one of FiLM, Conv, or None'
         
         self.gating_fn = lambda q, context: context # i.e. no gating
-        if gating_method == 'FiLM': # doesn't work well as is
+        if gating_method == 'FiLM': 
             self.init_FiLM(d_model=dim)
             self.gating_fn = self.apply_FiLM
 
@@ -384,7 +429,10 @@ class IntegrationConformerBlock(nn.Module):
             self.init_sigmoid_gating(d_model=dim)
             self.gating_fn = self.apply_sigmoid_gating
 
-        #self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
+        #self.attn1 = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
+        #self.attn2 = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
+        
+        
         self.attn1 = xAttention( 
             dim=dim,
             dim_head=dim_head,
@@ -400,6 +448,7 @@ class IntegrationConformerBlock(nn.Module):
             dropout=attn_dropout,
             return_intermediates=False
         )
+        
 
         self.convQ = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
         self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
@@ -440,17 +489,17 @@ class IntegrationConformerBlock(nn.Module):
         gate = self.sigmoid(W1o + W2o + self.sigmoid_gating_b)
         return q * gate + x_context * (1 - gate)
 
-    def forward(self, Qs, KVs, mask = None, context_mask = None):
+    def forward(self, Qs, KVs, mask = None, context_mask = None, rel_pos = None):
         Qs = self.ff1Q(Qs) + Qs
         KVs = self.ff1KV(KVs) + KVs
 
         Qs = self.convQ(Qs) + Qs
         KVs = self.convKV(KVs) + KVs
 
-        x = self.attn1(x=Qs, context=KVs, mask=mask, context_mask=context_mask) + Qs
+        x = self.attn1(x=Qs, context=KVs, mask=mask, context_mask=context_mask, rel_pos=rel_pos) + Qs #rel_pos=rel_pos
         x = self.gating_fn(Qs, x)
 
-        x = self.attn2(x=Qs, context=x, mask=mask, context_mask=mask) + Qs # x.shape -> q.shape because of previous attention layer so we use the Q mask for both inputs here
+        x = self.attn2(x=Qs, context=x, mask=mask, context_mask=mask, rel_pos=rel_pos) + Qs # x.shape -> q.shape because of previous attention layer so we use the Q mask for both inputs here
 
         x = self.ff2(x) + x
         x = self.post_norm(x)
