@@ -69,6 +69,9 @@ class PreNorm(nn.Module):
         x = self.norm(x)
         return self.fn(x, **kwargs)
 
+
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -91,7 +94,7 @@ class Attention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, context = None, mask = None, context_mask = None):
+    def forward(self, x, context = None, mask = None, context_mask = None, rel_pos = None, rotary_pos_emb=None):
         n, device, h, max_pos_emb, has_context = x.shape[-2], x.device, self.heads, self.max_pos_emb, exists(context)
         context = default(context, x) 
 
@@ -189,7 +192,9 @@ class GroupedConformerBlock(nn.Module):
         grouped_attn_size = 2,
         pad_mask_fn = None, # function to create padding mask from list of lengths and sequence length i.e pad_mask_fn(lengths, seq_len) -> mask
         constant_dim = True, # if true uses projection layers to keep the dimension constant
-        experimental_settings=False
+        experimental_settings=False,
+        talking_heads = True,
+        num_mem_tokens = 16,
     ):
         super().__init__()
         self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
@@ -197,20 +202,24 @@ class GroupedConformerBlock(nn.Module):
         self.constant_dim = constant_dim
         self.pad_mask_fn = pad_mask_fn
 
-        assert exists(pad_mask_fn), 'pad_mask_fn must be defined'
+        assert exists(pad_mask_fn) or grouped_attn_size == 1, 'pad_mask_fn must be defined if grouped_attn_size > 1'
 
         self.grouped_attn_size = grouped_attn_size
         
         dim_size = dim * self.grouped_attn_size #if self.constant_dim == False else dim
         dim_head = dim_size // heads if self.constant_dim == False else dim // heads
 
+        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
+        
         if experimental_settings == False:
             self.attn = xAttention( 
                 dim=dim_size,
                 dim_head=dim_head,
                 heads=heads,
                 dropout=attn_dropout,
-                return_intermediates=False
+                return_intermediates=False,
+                talking_heads=talking_heads,
+                num_mem_kv=num_mem_tokens,
             )
         else:
             self.attn = xAttention( # possibly also add residual attention
@@ -221,8 +230,9 @@ class GroupedConformerBlock(nn.Module):
                 return_intermediates=False,
                 num_mem_kv=32,
                 talking_heads = True, 
+                sparse_topk=8
             )   #         sparse_topk=8, # maybe not for audio (or larger)
-
+        
 
         self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
@@ -275,9 +285,12 @@ class GroupedConformerBlock(nn.Module):
     def forward(self, x, lengths, mask=None, rel_pos=None, rotary_pos_emb=None):
         x = self.ff1(x) + x
 
-        #print(x.shape, 'x')
         grouped_x, grouped_mask = self.group_x(x, lengths, mask)
-        #print(grouped_x.shape, 'grouped_x')
+        
+        #check if rotary positional embedding is formed or is is a instance of a class (created in the first layer)
+        if isinstance(rotary_pos_emb, nn.Module):
+            max_rotary_emb_length = grouped_x.shape[1]
+            rotary_pos_emb = rotary_pos_emb(max_rotary_emb_length, grouped_x.device)
 
         x = self.ungroup_x(self.attn(
             grouped_x, 
@@ -286,12 +299,11 @@ class GroupedConformerBlock(nn.Module):
             rotary_pos_emb = rotary_pos_emb
             ), seq_len=x.shape[1]) + x
 
-        #print(x.shape, 'x')
 
         x = self.conv(x) + x
         x = self.ff2(x) + x
         x = self.post_norm(x)
-        return x, grouped_mask
+        return x, grouped_mask, rotary_pos_emb
 
 
 # Conformer Block

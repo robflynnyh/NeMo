@@ -128,22 +128,24 @@ class GroupedConformerEncoder(NeuralModule, Exportable):
         subsampling_factor=4,
         subsampling_conv_channels=-1,
         ff_expansion_factor=4,
-        self_attention_model='rel_pos',
+        self_attention_model='rotary',
         n_heads=4,
         att_context_size=None,
         xscaling=True,
         untie_biases=True,
-        pos_emb_max_len=5000,
+        pos_emb_max_len=5000,   
         conv_kernel_size=31,
         conv_norm_type='batch_norm',
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
-        group_attn_size=2, # 1 for standard attention
+        group_attn_size=1, # 1 for standard attention
         conv_expansion_factor=1,
         grouping_constant_dim=True,
         checkpoint_every_n_layers=2,
-        experimental_settings=True
+        experimental_settings=False,
+        talking_heads=True,
+        num_mem_tokens=0
     ):
         super().__init__()
 
@@ -156,6 +158,9 @@ class GroupedConformerEncoder(NeuralModule, Exportable):
         self.scale = math.sqrt(self.d_model)
 
         self.grouping_constant_dim = grouping_constant_dim
+
+        self.talking_heads = talking_heads
+        self.num_mem_tokens = num_mem_tokens
 
         if xscaling:
             self.xscale = math.sqrt(d_model)
@@ -188,6 +193,7 @@ class GroupedConformerEncoder(NeuralModule, Exportable):
         self.pos_emb_max_len = pos_emb_max_len
         self.pos_type = self_attention_model
         if self_attention_model == "rel_pos":
+            assert 1==2, "rel_pos is not working here yet"
             self.pos_enc = RelativePositionBias(
                 scale = self.xscale,
                 causal = False,
@@ -196,7 +202,7 @@ class GroupedConformerEncoder(NeuralModule, Exportable):
                 heads = n_heads
             )
         elif self_attention_model == "rotary":
-            dim_head = (d_model * group_attn_size) // n_heads if self.constant_dim == False else d_model // n_heads
+            dim_head = (d_model * group_attn_size) // n_heads if self.grouping_constant_dim == False else d_model // n_heads
             rotary_emb_dim = max(dim_head // 2, 32)
             self.pos_enc = RotaryEmbedding(rotary_emb_dim)
             
@@ -220,7 +226,9 @@ class GroupedConformerEncoder(NeuralModule, Exportable):
                 grouped_attn_size=self.group_attn_size,
                 pad_mask_fn=self.make_pad_mask,
                 constant_dim=self.grouping_constant_dim,
-                experimental_settings=experimental_settings
+                experimental_settings=experimental_settings,
+                talking_heads=self.talking_heads,
+                num_mem_tokens=self.num_mem_tokens
             )
             self.layers.append(layer)
 
@@ -280,15 +288,15 @@ class GroupedConformerEncoder(NeuralModule, Exportable):
         max_audio_length = audio_signal.size(1)
         # Create the self-attention and padding masks
 
-        pad_mask=None # initally set to None, that gets created in the first layer
+        pad_mask=None if self.group_attn_size > 1 else self.make_pad_mask(max_audio_length, length) # grouped attention mask is created in the GroupedConformerBlock
         rel_pos = self.pos_enc if self.pos_type == "rel_pos" else None
         rotary_pos_emb = self.pos_enc if self.pos_type == "rotary" else None
 
         for lth, layer in enumerate(self.layers):
             if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:
-                audio_signal, pad_mask = checkpoint(self.create_custom_forward(layer), audio_signal, length, pad_mask, rel_pos, rotary_pos_emb)
+                audio_signal, pad_mask, rotary_pos_emb = checkpoint(self.create_custom_forward(layer), audio_signal, length, pad_mask, rel_pos, rotary_pos_emb)
             else:
-                audio_signal, pad_mask = layer(
+                audio_signal, pad_mask, rotary_pos_emb = layer(
                     x=audio_signal,
                     lengths=length,
                     mask=pad_mask,

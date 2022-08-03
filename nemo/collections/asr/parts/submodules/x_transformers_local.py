@@ -521,7 +521,8 @@ class Attention(nn.Module):
         value_dim_head = None,
         scale_log_seq = False,
         scale_log_seq_base = 512,
-        return_intermediates = True
+        return_intermediates = True,
+        use_bias=False
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -542,12 +543,12 @@ class Attention(nn.Module):
             v_dim = value_dim_head
             out_dim = v_dim * heads
 
-        self.to_q = nn.Linear(dim, q_dim, bias = False)
-        self.to_k = nn.Linear(dim, k_dim, bias = False)
+        self.to_q = nn.Linear(dim, q_dim, bias = use_bias)
+        self.to_k = nn.Linear(dim, k_dim, bias = use_bias)
 
         # shared key / values, for further memory savings during inference
         assert not (shared_kv and value_dim_head != dim_head), 'key and value head dimensions must be equal for shared key / values'
-        self.to_v = nn.Linear(dim, v_dim, bias = False) if not shared_kv else None
+        self.to_v = nn.Linear(dim, v_dim, bias = use_bias) if not shared_kv else None
 
         # dropout
         self.dropout = nn.Dropout(dropout)
@@ -574,8 +575,8 @@ class Attention(nn.Module):
         # talking heads
         self.talking_heads = talking_heads
         if talking_heads:
-            self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias = False)
-            self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias = False)
+            self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias = use_bias)
+            self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias = use_bias)
 
         # head scaling
         self.head_scale = head_scale
@@ -596,7 +597,7 @@ class Attention(nn.Module):
 
         # attention on attention
         self.attn_on_attn = on_attn
-        self.to_out = nn.Sequential(nn.Linear(out_dim, dim * 2, bias = False), nn.GLU()) if on_attn else nn.Linear(out_dim, dim, bias = False)
+        self.to_out = nn.Sequential(nn.Linear(out_dim, dim * 2, bias = use_bias), nn.GLU()) if on_attn else nn.Linear(out_dim, dim, bias = use_bias)
 
         # init output projection 0
         if zero_init_output:
