@@ -442,7 +442,7 @@ class IntegrationConformerBlock(nn.Module):
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
-        conv_expansion_factor = 2,
+        conv_expansion_factor = 1,
         conv_kernel_size = 31,
         attn_dropout = 0.,
         ff_dropout = 0.,
@@ -464,9 +464,6 @@ class IntegrationConformerBlock(nn.Module):
         elif gating_method == 'Sigmoid':
             self.init_sigmoid_gating(d_model=dim)
             self.gating_fn = self.apply_sigmoid_gating
-
-        #self.attn1 = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
-        #self.attn2 = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
         
         
         self.attn1 = xAttention( 
@@ -474,7 +471,8 @@ class IntegrationConformerBlock(nn.Module):
             dim_head=dim_head,
             heads=heads,
             dropout=attn_dropout,
-            return_intermediates=False
+            return_intermediates=False,
+            use_bias=True
         )
 
         self.attn2 = xAttention( 
@@ -482,7 +480,8 @@ class IntegrationConformerBlock(nn.Module):
             dim_head=dim_head,
             heads=heads,
             dropout=attn_dropout,
-            return_intermediates=False
+            return_intermediates=False,
+            use_bias=True
         )
         
 

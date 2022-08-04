@@ -55,7 +55,7 @@ class ConvSubsampling(torch.nn.Module):
         activation (Module): activation function, default is nn.ReLU()
     """
 
-    def __init__(self, subsampling, subsampling_factor, feat_in, feat_out, conv_channels, activation=nn.ReLU()):
+    def __init__(self, subsampling, subsampling_factor, feat_in, feat_out, conv_channels, activation=nn.ReLU(), stride=2, kernel_size=3):
         super(ConvSubsampling, self).__init__()
         self._subsampling = subsampling
 
@@ -69,8 +69,8 @@ class ConvSubsampling(torch.nn.Module):
 
         if subsampling == 'vggnet':
             self._padding = 0
-            self._stride = 2
-            self._kernel_size = 2
+            self._stride = stride
+            self._kernel_size = kernel_size
             self._ceil_mode = True
 
             for i in range(self._sampling_num):
@@ -97,8 +97,8 @@ class ConvSubsampling(torch.nn.Module):
                 in_channels = conv_channels
         elif subsampling == 'striding':
             self._padding = 1
-            self._stride = 2
-            self._kernel_size = 3
+            self._stride = stride
+            self._kernel_size = kernel_size
             self._ceil_mode = False
 
             for i in range(self._sampling_num):

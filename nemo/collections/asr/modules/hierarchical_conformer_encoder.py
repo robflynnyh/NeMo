@@ -138,7 +138,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
-        downsampling_type='pooling', #  'pooling' or 'conv'
+        downsampling_type='conv', #  'pooling' or 'conv'
         n_repeats=3, # number of repeats of the cross-conformer layers
         checkpoint_last_layer=False, # turn grad checkpointing off for last layer of the last iteration
         checkpoint_every_n_layers=2,
@@ -218,13 +218,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
         # from other module to change all this later
       
-        self.rel_pos = RelativePositionBias(
-            scale = self.xscale,
-            causal = False,
-            max_distance = pos_emb_max_len,
-            num_buckets = pos_emb_max_len // 4,
-            heads = n_heads
-        )
+        self.rel_pos = None
     
 
         self.layers = nn.ModuleList()
@@ -254,7 +248,8 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
                     param.grad = None # freeze all gradients stops optimizer from updating
 
         self.CrossConformerLayers = nn.ModuleList()
-     
+
+        '''
         layer = FunnelConformerBlock(
             dim=d_model,
             heads=n_heads,
@@ -267,13 +262,13 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             conv_dropout=dropout,
         )
         self.CrossConformerLayers.append(layer)
-
+        ''' 
         layer = IntegrationConformerBlock(
             dim=d_model,
             heads=n_heads,
             dim_head=d_model // n_heads,
             ff_mult=ff_expansion_factor,
-            conv_expansion_factor = 2,
+            conv_expansion_factor = 1,
             conv_kernel_size=conv_kernel_size,
             attn_dropout=dropout_att,
             ff_dropout=dropout,
@@ -281,14 +276,31 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             gating_method=self.gating_method
         )
         self.CrossConformerLayers.append(layer)
+
+        # positional vectors equal to the model dimension init with xavier uniform
+        self.utterance_start_pos = torch.nn.Parameter(torch.Tensor(d_model))
+        self.utterance_end_pos = torch.nn.Parameter(torch.Tensor(d_model))
+        nn.init.normal_(self.utterance_start_pos, 0, d_model ** -0.5) 
+        nn.init.normal_(self.utterance_end_pos, 0, d_model ** -0.5)
+
         
         self.downsampling_type = downsampling_type
 
         if downsampling_type == 'pooling':
             self.downsampling = nn.AvgPool1d(kernel_size=3, stride=3, count_include_pad=False) # don't count padding in average 
-        elif downsampling_type == 'conv': # NOT IMPLEMENTED YET
-            raise ValueError("Convolutional downsampling is not implemented yet!")
-            self.downsampling = nn.Conv1d(d_model, d_model, kernel_size=3, stride=3)
+
+        elif downsampling_type == 'conv': 
+            self.downsampling = ConvSubsampling(
+                subsampling='striding',
+                subsampling_factor=2,
+                feat_in=d_model,
+                feat_out=d_model,
+                conv_channels=d_model,
+                stride=3,
+                kernel_size=3,
+                activation=nn.ReLU(),
+            )
+
         else:
             raise ValueError("Not valid downsampling type: '{}'!".format(downsampling_type))
 
@@ -380,98 +392,86 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
         for repeat in range(self.n_repeats):
 
-            #''' NONE OF THIS IS WORKING WHY
-            # downsample the sequence length using average pooling or convolution
             if self.downsampling_type == 'pooling': 
-                pooled_audio_signal = self.downsampling(audio_signal.transpose(1, 2)).transpose(1, 2) # transpose so that the sequence length is the first dimension
-            # TODO: implement convolutional downsampling
-            
-            # we need to create new masks and pos_embs for the downsampled sequence length
-            max_downsampled_audio_length = pooled_audio_signal.size(1)
-            # calculate new length of each element (without padding) in the downsampled sequence
-            
-            downsampled_lengths = length.div(3, rounding_mode=None).ceil().int() # round up to make sure we don't cut off the last element or have a zero length
-            downsampled_pad_mask = self.make_pad_mask(max_downsampled_audio_length, downsampled_lengths)
+                downsampled_audio_signal = self.downsampling(audio_signal.transpose(1, 2)).transpose(1, 2) # transpose so that the sequence length is the first dimension
+                downsampled_length = length.div(3, rounding_mode=None).ceil().int()
 
+            elif self.downsampling_type == 'conv':
+                downsampled_audio_signal, downsampled_length = self.downsampling(audio_signal, length)
+            
+            max_downsampled_audio_length = downsampled_audio_signal.size(1)
+
+
+            '''
             downsampled_x = checkpoint(self.create_custom_forward(self.CrossConformerLayers[0]), 
                 pooled_audio_signal, # Qs
                 audio_signal, # Ks
                 downsampled_pad_mask, # mask 
                 pad_mask # Context mask
             )
-            cat_downsampled_pad_mask = torch.empty(downsampled_pad_mask.shape[0], downsampled_pad_mask.shape[1]*3, dtype=torch.bool, device=downsampled_pad_mask.device)
-            cat_downsampled_x = torch.empty((downsampled_x.shape[0], downsampled_x.shape[1]*3, downsampled_x.shape[2]), device=downsampled_x.device)
-            padding_length = torch.tensor([0], dtype=torch.int32, device=downsampled_lengths.device) # padding items have a sequence length of 0
-            cat_downsampled_lengths = torch.cat([padding_length,  downsampled_lengths, padding_length], dim=0)
-
-            left_and_right_padding = torch.zeros_like(downsampled_x[0, :, :]).unsqueeze(0)
-            downsampled_x = torch.cat((left_and_right_padding, downsampled_x, left_and_right_padding), dim=0) 
-         
-         
-            # hopefully I can think of a nicer way to do this probably torch.gather
-            for i in range(1, downsampled_x.shape[0]-1): # skip the first and last element (the padding)
-                position = i - 1 
-                left_seq = downsampled_x[i-1, :cat_downsampled_lengths[i-1], :]
-                left_seq_padding = downsampled_x[i-1, cat_downsampled_lengths[i-1]:, :]
-                #
-                right_seq = downsampled_x[i+1, :cat_downsampled_lengths[i+1], :]
-                right_seq_padding = downsampled_x[i+1, cat_downsampled_lengths[i+1]:, :]
-                #
-                middle_seq = downsampled_x[i, :cat_downsampled_lengths[i], :]
-                middle_seq_padding = downsampled_x[i, cat_downsampled_lengths[i]:, :]
-                
-                #
-                # now concatenate all these things (clean this all up later future me)
-                non_pad_seq = torch.cat((left_seq, middle_seq, right_seq), dim=0)
-                pad_seq = torch.cat((left_seq_padding, middle_seq_padding, right_seq_padding), dim=0)
-
-                full_seq = torch.cat((non_pad_seq, pad_seq), dim=0)
-                #del pad_seq, left_seq, left_seq_padding, right_seq, right_seq_padding, middle_seq, middle_seq_padding
-
-                cur_pad_mask = torch.zeros(cat_downsampled_x[position, :, :].shape[0], dtype=torch.bool, device=downsampled_x.device)
-                cur_pad_mask[:non_pad_seq.shape[0]] = True
-
-                cat_downsampled_x[position, :, :] = full_seq.unsqueeze(0)
-                cat_downsampled_pad_mask[position, :] = cur_pad_mask.reshape(-1)
-            #    NONE OF THIS IS WORKING WHY
-            #'''
+            '''
     
-            #cat_downsampled_x = torch.cat((audio_signal, torch.zeros_like(audio_signal[0, :, :]).unsqueeze(0)), dim=0).roll(shifts=1, dims=0)[:-1]
-            #cat_downsampled_pad_mask = torch.cat((pad_mask, torch.zeros_like(pad_mask[0]).bool().unsqueeze(0)), dim=0).roll(shifts=1, dims=0)[:-1]
-            # the above two lines of code do the following:
-            # 1. concatenate the audio signal with a zero vector the size of 1 element of the audio signal (along the sequence dimension)
-            # 2. roll the audio signal along the sequence dimension by 1 element (so that the first element is now the second element)
-            # 3. remove the last element 
-            # 4. repeat the process for the pad mask
-            # Why?
-            # so the audio signal is lined up with a sequence that is shifted by 1 element to the right
-            # Why?
-            # Because the following cross-attention layer with apply attention between the audio signal and the shifted sequence
-            # Why?
-            # So that each element can attent to the previous element in the sequence
+            conjoined_downsampled_sequence = downsampled_audio_signal.reshape(-1, self.d_model)
             
-            # randomly permute both cat_downsampled_x and cat_downsampled_pad_mask
-            # Why?
-            # to de-bug the cross-attention layer
-
+            non_padding_idxs = []
             
+            for i, el in enumerate(downsampled_length):
+                start = i * max_downsampled_audio_length
+                non_padding_idxs.extend([start + idx for idx in range(el)])
+            non_padding_idxs = torch.tensor(non_padding_idxs, dtype=torch.long, device=downsampled_audio_signal.device)
+            conjoined_downsampled_sequence = conjoined_downsampled_sequence[non_padding_idxs]
 
+            current_start = 0
+            sequence_end = conjoined_downsampled_sequence.shape[0]
+            
+            max_length = max_audio_length if max_audio_length < conjoined_downsampled_sequence.shape[0] else conjoined_downsampled_sequence.shape[0]
+            context_sequences = torch.empty(downsampled_audio_signal.shape[0], max_length, self.d_model, dtype=torch.float, device=downsampled_audio_signal.device)
+            
+            # append self.utterance_start_token to the start of each item in the batch
+
+            for i in range(downsampled_audio_signal.shape[0]):
+                cur_size = downsampled_length[i].item() 
+                current_end = current_start + cur_size
+                desired_segemnt_length = (max_length-cur_size)//(3-1)
+
+                post = current_end + desired_segemnt_length
+                pre = post - max_length
+          
+                if post > sequence_end:
+                    post = sequence_end
+                    pre = post - max_length
+                elif pre < 0:
+                    pre = 0
+                    post = pre + max_length
+
+                assert post-pre == max_length, f"post-pre must be equal to max_downsampled_audio_length, {post-pre}, {max_length}"
+                assert current_start >= pre and current_end <= post, f"current_start must be >= pre and current_end must be <= post, {current_start}, {pre}, {current_end}, {post}"
+              
+                context_sequences[i] = conjoined_downsampled_sequence[pre:post]
+                # add utterance start and end vectors to beggining and end of each sequence
+                context_sequences[i, current_start-pre] += self.utterance_start_pos
+                context_sequences[i, current_end-pre-1] +=  self.utterance_end_pos
+                current_start += cur_size 
+            # end of messy af
+
+        
             if repeat == self.n_repeats - 1 and self.checkpoint_last_layer == False:
-                audio_signal = self.CrossConformerLayers[1](
+                audio_signal = self.CrossConformerLayers[-1](
                     Qs=audio_signal,
-                    KVs=cat_downsampled_x,
+                    KVs=context_sequences,
                     mask=pad_mask,
-                    context_mask=cat_downsampled_pad_mask,
+                    context_mask=None, # no padding :P
                     rel_pos=self.rel_pos
                 )
             else:
-                audio_signal = checkpoint(self.create_custom_forward(self.CrossConformerLayers[1]), 
+                audio_signal = checkpoint(self.create_custom_forward(self.CrossConformerLayers[-1]), 
                     audio_signal, # Qs
-                    cat_downsampled_x, # KVs
+                    context_sequences, # KVs
                     pad_mask,  # mask
-                    cat_downsampled_pad_mask, # context_mask
+                    None, # context_mask
                     self.rel_pos
                 )
+        
 
 
         if self.out_proj is not None:
