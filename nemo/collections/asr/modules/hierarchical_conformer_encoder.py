@@ -429,6 +429,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             
             # append self.utterance_start_token to the start of each item in the batch
 
+            # indexes are like 1 of sometimes cus of zero indexng need to fix that or just think of a better way to do this gosh
             for i in range(downsampled_audio_signal.shape[0]):
                 cur_size = downsampled_length[i].item() 
                 current_end = current_start + cur_size
