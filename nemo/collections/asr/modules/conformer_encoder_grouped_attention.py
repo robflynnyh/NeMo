@@ -139,13 +139,18 @@ class GroupedConformerEncoder(NeuralModule, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
-        group_attn_size=1, # 1 for standard attention
+        group_attn_size=2, # 1 for standard attention
         conv_expansion_factor=1,
         grouping_constant_dim=True,
         checkpoint_every_n_layers=2,
         experimental_settings=False,
         talking_heads=True,
-        num_mem_tokens=0
+        num_mem_tokens=16,
+        pre_scale_group_attn=True,
+        qk_norm=False,
+        qk_norm_scale=1,
+        qk_norm_groups=1,
+        sparse_topk=None
     ):
         super().__init__()
 
@@ -228,7 +233,12 @@ class GroupedConformerEncoder(NeuralModule, Exportable):
                 constant_dim=self.grouping_constant_dim,
                 experimental_settings=experimental_settings,
                 talking_heads=self.talking_heads,
-                num_mem_tokens=self.num_mem_tokens
+                num_mem_tokens=self.num_mem_tokens,
+                pre_scale=pre_scale_group_attn,
+                qk_norm=qk_norm,
+                qk_norm_scale=qk_norm_scale,
+                qk_norm_groups=qk_norm_groups,
+                sparse_topk=sparse_topk
             )
             self.layers.append(layer)
 

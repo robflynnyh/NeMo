@@ -195,19 +195,33 @@ class GroupedConformerBlock(nn.Module):
         experimental_settings=False,
         talking_heads = True,
         num_mem_tokens = 16,
+        pre_scale = False,
+        qk_norm=False,
+        qk_norm_groups=1,
+        qk_norm_scale=1,
+        sparse_topk=None,
     ):
         super().__init__()
         self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
         
         self.constant_dim = constant_dim
         self.pad_mask_fn = pad_mask_fn
+        self.pre_scale = pre_scale
+
+        if self.pre_scale and self.constant_dim == False:
+            raise ValueError('pre_scale is only supported when constant_dim is True')
+
 
         assert exists(pad_mask_fn) or grouped_attn_size == 1, 'pad_mask_fn must be defined if grouped_attn_size > 1'
 
         self.grouped_attn_size = grouped_attn_size
         
-        dim_size = dim * self.grouped_attn_size #if self.constant_dim == False else dim
+        dim_size = dim * self.grouped_attn_size if self.pre_scale == False else dim
         dim_head = dim_size // heads if self.constant_dim == False else dim // heads
+
+        if self.pre_scale:
+            self.scale_down = nn.Linear(dim_size * self.grouped_attn_size, dim_size)
+            self.scale_up = nn.Linear(dim_size, dim_size * self.grouped_attn_size)
 
         self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
         
@@ -220,6 +234,10 @@ class GroupedConformerBlock(nn.Module):
                 return_intermediates=False,
                 talking_heads=talking_heads,
                 num_mem_kv=num_mem_tokens,
+                qk_norm = qk_norm,
+                qk_norm_groups = qk_norm_groups,
+                qk_norm_scale = qk_norm_scale,
+                sparse_topk = sparse_topk
             )
         else:
             self.attn = xAttention( # possibly also add residual attention
@@ -230,8 +248,8 @@ class GroupedConformerBlock(nn.Module):
                 return_intermediates=False,
                 num_mem_kv=32,
                 talking_heads = True, 
-                sparse_topk=8
-            )   #         sparse_topk=8, # maybe not for audio (or larger)
+                #sparse_topk=8
+            )   #        
         
 
         self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
@@ -268,6 +286,9 @@ class GroupedConformerBlock(nn.Module):
             new_lengths = torch.div(lengths, attn_groups).ceil().long()
             new_mask = self.pad_mask_fn(grouped_x.shape[1], new_lengths)
 
+        if self.pre_scale:
+            grouped_x = self.scale_down(grouped_x)
+
         return grouped_x, new_mask
 
 
@@ -279,6 +300,9 @@ class GroupedConformerBlock(nn.Module):
         '''
         if self.grouped_attn_size == 1:
             return x
+
+        if self.pre_scale:
+            x = self.scale_up(x)
 
         return x.reshape(x.shape[0], -1, x.shape[2] // self.grouped_attn_size)[:, :seq_len, :]
 
