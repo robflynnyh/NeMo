@@ -223,7 +223,7 @@ class GroupedConformerBlock(nn.Module):
             self.scale_down = nn.Linear(dim_size * self.grouped_attn_size, dim_size)
             self.scale_up = nn.Linear(dim_size, dim_size * self.grouped_attn_size)
 
-        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
+        #self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
         
         if experimental_settings == False:
             self.attn = xAttention( 
