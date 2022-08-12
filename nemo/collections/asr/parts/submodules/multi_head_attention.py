@@ -52,7 +52,7 @@ class MultiHeadAttention(nn.Module):
         dropout_rate (float): dropout rate
     """
 
-    def __init__(self, n_head, n_feat, dropout_rate):
+    def __init__(self, n_head, n_feat, dropout_rate, sparse_topk=None):
         """Construct an MultiHeadedAttention object."""
         super(MultiHeadAttention, self).__init__()
         assert n_feat % n_head == 0
@@ -65,6 +65,7 @@ class MultiHeadAttention(nn.Module):
         self.linear_v = nn.Linear(n_feat, n_feat)
         self.linear_out = nn.Linear(n_feat, n_feat)
         self.dropout = nn.Dropout(p=dropout_rate)
+        self.sparse_topk = sparse_topk
 
     def forward_qkv(self, query, key, value):
         """Transforms query, key and value.
@@ -96,6 +97,13 @@ class MultiHeadAttention(nn.Module):
         returns:
             value (torch.Tensor): transformed `value` (batch, time2, d_model) weighted by the attention scores
         """
+        if self.sparse_topk is not None and self.sparse_topk < scores.shape[-1]:
+            top, _ = scores.topk(self.sparse_topk, dim = -1)
+            vk = top[..., -1].unsqueeze(-1).expand_as(scores)
+            tk_mask = scores < vk
+            scores.masked_fill_(tk_mask, -torch.finfo(scores.dtype).max)
+            del tk_mask
+
         n_batch = value.size(0)
         if mask is not None:
             mask = mask.unsqueeze(1)  # (batch, 1, time1, time2)
@@ -103,6 +111,7 @@ class MultiHeadAttention(nn.Module):
             attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)  # (batch, head, time1, time2)
         else:
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
+
 
         p_attn = self.dropout(attn)
         x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
@@ -134,9 +143,9 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         dropout_rate (float): dropout rate
     """
 
-    def __init__(self, n_head, n_feat, dropout_rate, pos_bias_u, pos_bias_v):
+    def __init__(self, n_head, n_feat, dropout_rate, pos_bias_u, pos_bias_v, sparse_topk=None):
         """Construct an RelPositionMultiHeadedAttention object."""
-        super().__init__(n_head, n_feat, dropout_rate)
+        super().__init__(n_head, n_feat, dropout_rate, sparse_topk)
         # linear transformation for positional encoding
         self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
         # these two learnable biases are used in matrix c and matrix d

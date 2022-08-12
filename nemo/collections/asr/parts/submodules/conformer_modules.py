@@ -52,12 +52,15 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         dropout_att=0.1,
         pos_bias_u=None,
         pos_bias_v=None,
+        sparse_topk=None,
     ):
         super(ConformerLayer, self).__init__()
 
         self.self_attention_model = self_attention_model
         self.n_heads = n_heads
         self.fc_factor = 0.5
+
+        self.sparse_topk = sparse_topk
 
         # first feed forward module
         self.norm_feed_forward1 = LayerNorm(d_model)
@@ -71,10 +74,10 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         self.norm_self_att = LayerNorm(d_model)
         if self_attention_model == 'rel_pos':
             self.self_attn = RelPositionMultiHeadAttention(
-                n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v
+                n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v, sparse_topk=self.sparse_topk
             )
         elif self_attention_model == 'abs_pos':
-            self.self_attn = MultiHeadAttention(n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att)
+            self.self_attn = MultiHeadAttention(n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, sparse_topk=self.sparse_topk)
         else:
             raise ValueError(
                 f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
@@ -274,6 +277,8 @@ class ConformerConvolution(nn.Module):
             self.batch_norm = nn.BatchNorm1d(d_model)
         elif norm_type == 'layer_norm':
             self.batch_norm = nn.LayerNorm(d_model)
+        elif norm_type == 'group_norm':
+            self.batch_norm = nn.GroupNorm(num_groups=32, num_channels=d_model)
         else:
             raise ValueError(f"conv_norm_type={norm_type} is not valid!")
 

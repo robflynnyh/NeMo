@@ -520,11 +520,15 @@ class Attention(nn.Module):
         shared_kv = False,
         value_dim_head = None,
         scale_log_seq = False,
-        scale_log_seq_base = 512,
-        return_intermediates = True,
-        use_bias=False
+        scale_log_seq_base = 512, # below are added (by me) args
+        return_intermediates = True, 
+        use_bias=False,
+        cross_attn_pos_enc = None
     ):
         super().__init__()
+
+        self.cross_attn_pos_enc = cross_attn_pos_enc
+
         self.scale = dim_head ** -0.5
 
         self.heads = heads
@@ -612,6 +616,7 @@ class Attention(nn.Module):
         mask = None,
         context_mask = None,
         attn_mask = None,
+        gating_mask = None,
         rel_pos = None,
         sinusoidal_emb = None,
         rotary_pos_emb = None,
@@ -620,6 +625,8 @@ class Attention(nn.Module):
     ):
         b, n, _, h, talking_heads, head_scale, scale, device, has_context = *x.shape, self.heads, self.talking_heads, self.head_scale, self.scale, x.device, exists(context)
         kv_input = default(context, x)
+
+        kv_input = self.cross_attn_pos_enc(kv_input) if self.cross_attn_pos_enc else kv_input
 
         q_input = x
         k_input = kv_input
@@ -731,7 +738,9 @@ class Attention(nn.Module):
             dots = dots * log_seq_scale
 
         attn = self.attn_fn(dots, dim = -1)
+        attn = attn * gating_mask if exists(gating_mask) else attn
 
+        
         if self.return_intermediates:
             post_softmax_attn = attn.clone()
 

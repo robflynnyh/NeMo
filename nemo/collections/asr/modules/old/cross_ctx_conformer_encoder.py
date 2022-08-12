@@ -21,9 +21,7 @@ import torch.distributed
 import torch.nn as nn
 from omegaconf import DictConfig
 
-from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer #, CrossConformerLayer
-from nemo.collections.asr.parts.submodules.lucid_conformer import IntegrationConformerBlock, FunnelConformerBlock
-
+from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer
 from nemo.collections.asr.parts.submodules.multi_head_attention import PositionalEncoding, RelPositionalEncoding
 from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling, StackingSubsampling
 from nemo.collections.asr.parts.utils import adapter_utils
@@ -33,15 +31,16 @@ from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType
 
-from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
-from nemo.collections.asr.parts.submodules.x_transformers_local import RelativePositionBias
-
-__all__ = ['HierarchicalConformerEncoder']
+from torch.utils.checkpoint import checkpoint # gradient/activation checkpointing
+from nemo.collections.asr.parts.submodules.lucid_conformer import CrossAttnHistoryPositionalEncoding, CrossConformerBlock
 
 
+__all__ = ['CrossCtxConformerEncoder']
 
 
-class HierarchicalConformerEncoder(NeuralModule, Exportable):
+
+
+class CrossCtxConformerEncoder(NeuralModule, Exportable):
     """
     The encoder for ASR model of Conformer.
     Based on this paper:
@@ -138,20 +137,12 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
-        downsampling_type='conv', #  'pooling' or 'conv'
-        n_repeats=3, # number of repeats of the cross-conformer layers
-        checkpoint_last_layer=False, # turn grad checkpointing off for last layer of the last iteration
-        checkpoint_every_n_layers=2,
-        gating_method= 'Sigmoid', # FiLM, Sigmoid or None (FiLM is showing very bad results)
-        freeze_initial_encoder=False,
+        checkpoint_every_n_layers=1,
+        num_memory_vectors=10,
+        num_repeats = 3,
+        sparse_topk = 8
     ):
         super().__init__()
-
-        assert gating_method in ['FiLM', 'Sigmoid', 'None'], 'gating_method must be one of FiLM, Sigmoid or None'
-        self.gating_method = gating_method
-        
-        self.checkpoint_every_n_layers = checkpoint_every_n_layers
-        self.checkpoint_last_layer = checkpoint_last_layer
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -166,6 +157,8 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             self.xscale = math.sqrt(d_model)
         else:
             self.xscale = None
+
+        self.checkpoint_every_n_layers = checkpoint_every_n_layers
 
         if subsampling_conv_channels == -1:
             subsampling_conv_channels = d_model
@@ -216,16 +209,8 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
-        # from other module to change all this later
-      
-        self.rel_pos = None
-    
-
         self.layers = nn.ModuleList()
-        
-        assert n_layers > 2, "Number of layers must be at least 3!"
-
-        for i in range(n_layers - 3):
+        for i in range(n_layers):
             layer = ConformerLayer(
                 d_model=d_model,
                 d_ff=d_ff,
@@ -240,69 +225,61 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             )
             self.layers.append(layer)
 
-        if freeze_initial_encoder:
-            # freeze initial layers (use for adapting trained model to Hconformer attention)
-            print("Freezing initial encoder layers")
-            for layer in self.layers:
-                for param in layer.parameters():
-                    param.grad = None # freeze all gradients stops optimizer from updating
+        self.repeated_conformer_layer = ConformerLayer( # full seq layer
+                d_model=d_model,
+                d_ff=d_ff,
+                self_attention_model=self_attention_model,
+                n_heads=n_heads,
+                conv_kernel_size=conv_kernel_size,
+                conv_norm_type=conv_norm_type,
+                dropout=dropout,
+                dropout_att=dropout_att,
+                pos_bias_u=pos_bias_u,
+                pos_bias_v=pos_bias_v,
+                sparse_topk = sparse_topk
+        )
 
-        self.CrossConformerLayers = nn.ModuleList()
+        self.context_conformer_layer = ConformerLayer( # self-attention applied to context sequence
+                d_model=d_model,
+                d_ff=d_ff,
+                self_attention_model=self_attention_model,
+                n_heads=n_heads,
+                conv_kernel_size=conv_kernel_size,
+                conv_norm_type=conv_norm_type,
+                dropout=dropout,
+                dropout_att=dropout_att,
+                pos_bias_u=pos_bias_u,
+                pos_bias_v=pos_bias_v,
+                sparse_topk = sparse_topk
+        )
 
         '''
-        layer = FunnelConformerBlock(
-            dim=d_model,
-            heads=n_heads,
-            dim_head=d_model // n_heads,
-            ff_mult=ff_expansion_factor,
-            conv_expansion_factor = 2,
-            conv_kernel_size=conv_kernel_size,
-            attn_dropout=dropout_att,
-            ff_dropout=dropout,
-            conv_dropout=dropout,
+        self.cross_attn_pos_enc = CrossAttnHistoryPositionalEncoding( 
+            pos_dim=d_model,
+            max_seq_len=40,
+            num_context_vectors=num_memory_vectors
         )
-        self.CrossConformerLayers.append(layer)
-        ''' 
-        layer = IntegrationConformerBlock(
-            dim=d_model,
-            heads=n_heads,
-            dim_head=d_model // n_heads,
-            ff_mult=ff_expansion_factor,
-            conv_expansion_factor = 1,
-            conv_kernel_size=conv_kernel_size,
-            attn_dropout=dropout_att,
-            ff_dropout=dropout,
-            conv_dropout=dropout,
-            gating_method=self.gating_method
+        '''
+
+        '''
+        self.cross_conformer_layer = CrossConformerBlock( # cross attention applied between local and global context
+            dim = d_model,
+            dim_head = d_model // n_heads,
+            heads = n_heads,
+            ff_mult = ff_expansion_factor,
+            attn_dropout = dropout_att,
+            ff_dropout = dropout,
+            sparse_topk = sparse_topk,
         )
-        self.CrossConformerLayers.append(layer)
+        '''
 
-        # positional vectors equal to the model dimension init with xavier uniform
-        self.utterance_start_pos = torch.nn.Parameter(torch.Tensor(d_model))
-        self.utterance_end_pos = torch.nn.Parameter(torch.Tensor(d_model))
-        nn.init.normal_(self.utterance_start_pos, 0, d_model ** -0.5) 
-        nn.init.normal_(self.utterance_end_pos, 0, d_model ** -0.5)
+        self.num_repeats = num_repeats
 
-        
-        self.downsampling_type = downsampling_type
+        self.memory_dropout = nn.Dropout(0.25)
 
-        if downsampling_type == 'pooling':
-            self.downsampling = nn.AvgPool1d(kernel_size=3, stride=3, count_include_pad=False) # don't count padding in average 
-
-        elif downsampling_type == 'conv': 
-            self.downsampling = ConvSubsampling(
-                subsampling='striding',
-                subsampling_factor=2,
-                feat_in=d_model,
-                feat_out=d_model,
-                conv_channels=d_model,
-                stride=3,
-                kernel_size=3,
-                activation=nn.ReLU(),
-            )
-
-        else:
-            raise ValueError("Not valid downsampling type: '{}'!".format(downsampling_type))
+        self.num_memory_vectors = num_memory_vectors
+        self.memory_vectors = nn.Parameter(torch.Tensor(num_memory_vectors, d_model))
+        nn.init.uniform_(self.memory_vectors, -0.1, 0.1)
 
         if feat_out > 0 and feat_out != self._feat_out:
             self.out_proj = nn.Linear(self._feat_out, feat_out)
@@ -312,10 +289,6 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             self._feat_out = d_model
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
-
-        self.n_repeats = n_repeats
-
-
 
     def set_max_audio_length(self, max_audio_length):
         """
@@ -331,16 +304,16 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             self.register_buffer('seq_range', seq_range, persistent=False)
         self.pos_enc.extend_pe(max_audio_length, device)
 
+    @staticmethod
+    def create_custom_forward(module): # for activation checkpointing 
+        def custom_forward(*args, **kwargs):
+            return module(*args, **kwargs)
+        return custom_forward
+
     @typecheck()
     def forward(self, audio_signal, length=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_for_export(audio_signal=audio_signal, length=length)
-
-    @staticmethod
-    def create_custom_forward(module): # for activation checkpointing allow passing dictionary as the argument to the module
-        def custom_forward(*args, **kwargs):
-            return module(*args, **kwargs)
-        return custom_forward
 
     @typecheck()
     def forward_for_export(self, audio_signal, length):
@@ -364,23 +337,28 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         audio_signal, pos_emb = self.pos_enc(audio_signal)
         # adjust size
         max_audio_length = audio_signal.size(1)
+        max_audio_length += self.num_memory_vectors
+        length += self.num_memory_vectors
+        audio_signal = torch.cat([self.memory_vectors.unsqueeze(0).repeat([audio_signal.size(0), 1, 1]), audio_signal], dim=1)
+
         # Create the self-attention and padding masks
 
         pad_mask = self.make_pad_mask(max_audio_length, length)
         att_mask = pad_mask.unsqueeze(1).repeat([1, max_audio_length, 1])
         att_mask = torch.logical_and(att_mask, att_mask.transpose(1, 2))
-
-        if self.att_context_size[0] >= 0: 
-            att_mask = att_mask.triu(diagonal=-self.att_context_size[0]) 
+        if self.att_context_size[0] >= 0:
+            att_mask = att_mask.triu(diagonal=-self.att_context_size[0])
         if self.att_context_size[1] >= 0:
-            att_mask = att_mask.tril(diagonal=self.att_context_size[1]) 
-
+            att_mask = att_mask.tril(diagonal=self.att_context_size[1])
         att_mask = ~att_mask
 
         if self.use_pad_mask:
-            pad_mask = ~pad_mask 
+            pad_mask = ~pad_mask
         else:
             pad_mask = None
+
+
+        ########################
 
         for lth, layer in enumerate(self.layers):
             if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:
@@ -388,99 +366,52 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
             else:
                 audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
-        pad_mask = ~pad_mask # invert mask (other attention function inverts it later so needs to be inverted here...)
 
-        for repeat in range(self.n_repeats):
-
-            if self.downsampling_type == 'pooling': 
-                downsampled_audio_signal = self.downsampling(audio_signal.transpose(1, 2)).transpose(1, 2) # transpose so that the sequence length is the first dimension
-                downsampled_length = length.div(3, rounding_mode=None).ceil().int()
-
-            elif self.downsampling_type == 'conv':
-                downsampled_audio_signal, downsampled_length = self.downsampling(audio_signal, length)
-            
-            max_downsampled_audio_length = downsampled_audio_signal.size(1)
-
-
-            '''
-            downsampled_x = checkpoint(self.create_custom_forward(self.CrossConformerLayers[0]), 
-                pooled_audio_signal, # Qs
-                audio_signal, # Ks
-                downsampled_pad_mask, # mask 
-                pad_mask # Context mask
-            )
-            '''
-    
-            conjoined_downsampled_sequence = downsampled_audio_signal.reshape(-1, self.d_model)
-            
-            non_padding_idxs = []
-            
-            for i, el in enumerate(downsampled_length):
-                start = i * max_downsampled_audio_length
-                non_padding_idxs.extend([start + idx for idx in range(el)])
-            non_padding_idxs = torch.tensor(non_padding_idxs, dtype=torch.long, device=downsampled_audio_signal.device)
-            conjoined_downsampled_sequence = conjoined_downsampled_sequence[non_padding_idxs]
-
-            current_start = 0
-            sequence_end = conjoined_downsampled_sequence.shape[0]
-            
-            max_length = max_audio_length if max_audio_length < conjoined_downsampled_sequence.shape[0] else conjoined_downsampled_sequence.shape[0]
-            context_sequences = torch.empty(downsampled_audio_signal.shape[0], max_length, self.d_model, dtype=torch.float, device=downsampled_audio_signal.device)
-            
-            # append self.utterance_start_token to the start of each item in the batch
-
-            # indexes are like 1 of sometimes cus of zero indexng need to fix that or just think of a better way to do this gosh
-            for i in range(downsampled_audio_signal.shape[0]):
-                cur_size = downsampled_length[i].item() 
-                current_end = current_start + cur_size
-                desired_segemnt_length = (max_length-cur_size)//(3-1)
-
-                post = current_end + desired_segemnt_length
-                pre = post - max_length
-          
-                if post > sequence_end:
-                    post = sequence_end
-                    pre = post - max_length
-                elif pre < 0:
-                    pre = 0
-                    post = pre + max_length
-
-                assert post-pre == max_length, f"post-pre must be equal to max_downsampled_audio_length, {post-pre}, {max_length}"
-                assert current_start >= pre and current_end <= post, f"current_start must be >= pre and current_end must be <= post, {current_start}, {pre}, {current_end}, {post}"
-              
-                context_sequences[i] = conjoined_downsampled_sequence[pre:post]
-                # add utterance start and end vectors to beggining and end of each sequence
-                context_sequences[i, current_start-pre] += self.utterance_start_pos
-                context_sequences[i, current_end-pre-1] +=  self.utterance_end_pos
-                current_start += cur_size 
-            # end of messy af
-
+        context_conformer_pos_emb = None
+        for repeat in range(self.num_repeats):
+            memory_vectors = audio_signal[:, :self.num_memory_vectors, :]
+            # reshape to (1, num_context_seq * batch_size, dim)
+            memory_sequences = memory_vectors.reshape(1, -1, memory_vectors.size(-1))
+            # duplicate along the batch dimension
+            memory_sequences = memory_sequences.repeat(audio_signal.size(0), 1, 1)
+            # apply relative positional encoding to the memory sequences
+            memory_sequences = self.cross_attn_pos_enc(memory_sequences)
+            # dropout 0.25 of the memory sequences
+            memory_sequences = self.memory_dropout(memory_sequences)
+            # apply self attention over the memory sequences
+            if context_conformer_pos_emb == None:
+                memory_sequences, context_conformer_pos_emb = self.pos_enc(memory_sequences)
+            memory_sequences = checkpoint(self.create_custom_forward(self.context_conformer_layer), memory_sequences, None, context_conformer_pos_emb, None)
+            # re-apply the positional encoding to the memory sequences
+            memory_sequences = self.cross_attn_pos_enc(memory_sequences)
+            # now cross attention between memory vectors and memory sequences
+            ctx_memories = checkpoint(self.create_custom_forward(self.cross_conformer_layer), memory_vectors, memory_sequences)
+            # re-connect the ctx_memories to the audio_signal, but clone so we don't break the computation graph
+            #if repeat == self.num_repeats - 1:
+            #    import numpy as np
+            #    np.save('ctx_memories.npy', ctx_memories.detach().cpu().numpy())
+            #    np.save('audio_signal.npy', audio_signal[:, self.num_memory_vectors:, :].detach().cpu().numpy())
+            #    exit()
+            audio_signal = audio_signal.clone()
+            audio_signal[:, :self.num_memory_vectors, :] = ctx_memories
+            # now for final self attention over the audio_signal
+            if repeat != self.num_repeats - 1:
+                audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer), audio_signal, att_mask, pos_emb, pad_mask)
+            else: # don't checkpoint on last layer
+                audio_signal = self.repeated_conformer_layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
         
-            if repeat == self.n_repeats - 1 and self.checkpoint_last_layer == False:
-                audio_signal = self.CrossConformerLayers[-1](
-                    Qs=audio_signal,
-                    KVs=context_sequences,
-                    mask=pad_mask,
-                    context_mask=None, # no padding :P
-                    rel_pos=self.rel_pos
-                )
-            else:
-                audio_signal = checkpoint(self.create_custom_forward(self.CrossConformerLayers[-1]), 
-                    audio_signal, # Qs
-                    context_sequences, # KVs
-                    pad_mask,  # mask
-                    None, # context_mask
-                    self.rel_pos
-                )
-        
-
+        #########################
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
+
+        out_signal = audio_signal[:, self.num_memory_vectors:, :]
+        length -= self.num_memory_vectors
+
+        out_signal = torch.transpose(out_signal, 1, 2) # (batch, seq_len, d_model) -> (batch, d_model, seq_len) 
      
-        audio_signal = torch.transpose(audio_signal, 1, 2) # (batch, seq_len, d_model) -> (batch, d_model, seq_len) 
-     
-        return audio_signal, length
+        return out_signal, length
+
 
     def update_max_seq_length(self, seq_length: int, device):
         # Find global max audio length across all nodes
@@ -497,7 +428,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
 
     def make_pad_mask(self, max_audio_length, seq_lens):
         """Make masking for padding."""
-        mask = self.seq_range[:max_audio_length].expand(seq_lens.size(0), -1) < seq_lens.unsqueeze(-1) # boolean operater
+        mask = self.seq_range[:max_audio_length].expand(seq_lens.size(0), -1) < seq_lens.unsqueeze(-1)
         return mask
 
     def enable_pad_mask(self, on=True):
@@ -507,7 +438,7 @@ class HierarchicalConformerEncoder(NeuralModule, Exportable):
         return mask
 
 
-class HConformerEncoderAdapter(HierarchicalConformerEncoder, adapter_mixins.AdapterModuleMixin):
+class CrossCtxConformerEncoderAdapter(CrossCtxConformerEncoder, adapter_mixins.AdapterModuleMixin):
 
     # Higher level forwarding
     def add_adapter(self, name: str, cfg: dict):
@@ -539,5 +470,5 @@ class HConformerEncoderAdapter(HierarchicalConformerEncoder, adapter_mixins.Adap
 """
 Register any additional information
 """
-if adapter_mixins.get_registered_adapter(HierarchicalConformerEncoder) is None:
-    adapter_mixins.register_adapter(base_class=HierarchicalConformerEncoder, adapter_class=HConformerEncoderAdapter)
+if adapter_mixins.get_registered_adapter(CrossCtxConformerEncoder) is None:
+    adapter_mixins.register_adapter(base_class=CrossCtxConformerEncoder, adapter_class=CrossCtxConformerEncoderAdapter)

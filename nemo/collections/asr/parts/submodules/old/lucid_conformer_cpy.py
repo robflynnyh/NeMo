@@ -79,7 +79,6 @@ class Attention(nn.Module):
         heads = 8,
         dim_head = 64,
         dropout = 0.,
-        sparse_topk = None,
         max_pos_emb = 256,
         rel_pos_emb = None
     ):
@@ -90,8 +89,6 @@ class Attention(nn.Module):
         self.to_q = nn.Linear(dim, inner_dim, bias = True)
         self.to_kv = nn.Linear(dim, inner_dim * 2, bias = True)
         self.to_out = nn.Linear(inner_dim, dim)
-
-        self.sparse_topk = sparse_topk
 
         self.max_pos_emb = max_pos_emb
         self.rel_pos_emb = rel_pos_emb
@@ -124,13 +121,6 @@ class Attention(nn.Module):
             mask = rearrange(mask, 'b i -> b () i ()') * rearrange(context_mask, 'b j -> b () () j')
             dots.masked_fill_(~mask, mask_value)
 
-        if exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1]:
-            top, _ = dots.topk(self.sparse_topk, dim = -1)
-            vk = top[..., -1].unsqueeze(-1).expand_as(dots)
-            mask = dots < vk
-            dots.masked_fill_(mask, -torch.finfo(dots.dtype).max)
-            del mask
-
         attn = dots.softmax(dim = -1)
 
         attn = attn * gating_mask if exists(gating_mask) else attn
@@ -145,9 +135,8 @@ class GatingAttention(nn.Module):
     def __init__(
         self,
         dim,
-        heads = 4,
+        heads = 1,
         dim_head = 44,
-        cross_attn_pos_enc=None
     ):
         super().__init__()
         inner_dim = dim_head * heads
@@ -155,14 +144,10 @@ class GatingAttention(nn.Module):
         self.scale = dim_head ** -0.5
         self.to_q = nn.Linear(dim, inner_dim, bias = True)
         self.to_k = nn.Linear(dim, inner_dim, bias = True)
-        self.cross_attn_pos_enc = cross_attn_pos_enc
 
-    def forward(self, x, context = None, mask = None, context_mask = None, apply_pos_emb=False):
+    def forward(self, x, context = None, mask = None, context_mask = None, rel_pos = None):
         n, device, h, has_context = x.shape[-2], x.device, self.heads, exists(context)
         context = default(context, x)
-
-        if apply_pos_emb:
-            context = self.cross_attn_pos_enc(context) if exists(self.cross_attn_pos_enc) else context
 
         q, k = (self.to_q(x), self.to_k(context)) 
         q, k = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k)) 
@@ -198,16 +183,6 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def layernorm_fn(dim):
-    return nn.Sequential( # have to transpose before layernorm
-        Rearrange('b c n -> b n c'),
-        nn.LayerNorm(dim),
-        Rearrange('b n c -> b c n')
-    )
-
-def groupnorm_fn(dim, groups=32):
-    return nn.GroupNorm(num_groups=groups, num_channels=dim)
-    
 class ConformerConvModule(nn.Module):
     def __init__(
         self,
@@ -215,19 +190,11 @@ class ConformerConvModule(nn.Module):
         causal = False,
         expansion_factor = 2,
         kernel_size = 31,
-        dropout = 0.,
-        conv_norm_type = 'batch_norm'
-        ):
+        dropout = 0.):
         super().__init__()
 
         inner_dim = dim * expansion_factor
         padding = calc_same_padding(kernel_size) if not causal else (kernel_size - 1, 0)
-
-        norm_type = nn.BatchNorm1d 
-        if conv_norm_type == 'layer_norm':
-            norm_type = layernorm_fn
-        elif conv_norm_type == 'group_norm':
-            norm_type = groupnorm_fn
 
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
@@ -235,7 +202,7 @@ class ConformerConvModule(nn.Module):
             nn.Conv1d(dim, inner_dim * 2, 1),
             GLU(dim=1),
             DepthWiseConv1d(inner_dim, inner_dim, kernel_size = kernel_size, padding = padding),
-            norm_type(inner_dim) if not causal else nn.Identity(),
+            nn.BatchNorm1d(inner_dim) if not causal else nn.Identity(),
             Swish(),
             nn.Conv1d(inner_dim, dim, 1),
             Rearrange('b c n -> b n c'),
@@ -416,13 +383,11 @@ class ConformerBlock(nn.Module):
         conv_kernel_size = 31,
         attn_dropout = 0.,
         ff_dropout = 0.,
-        conv_dropout = 0.,
-        rel_pos_embs = None,
-        max_pos_emb = 256
+        conv_dropout = 0.
     ):
         super().__init__()
         self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout, rel_pos_emb = rel_pos_embs, max_pos_emb = max_pos_emb)
+        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
         self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
@@ -646,7 +611,6 @@ class CrossAttnHistoryPositionalEncoding(nn.Module):
         pos_matrix = pos_matrix.clamp(min=0, max=self.max_seq_len - 1).repeat_interleave(self.num_context_vectors, dim=1).long().to(x.device) 
 
         pos_embs = self.embedding(pos_matrix)
-        
     
         return x + pos_embs 
 
@@ -704,8 +668,7 @@ class IntegrationConformerBlock(nn.Module):
         self.gating_attention = GatingAttention(
             dim=dim,
             dim_head=dim_head,
-            heads=heads,
-            cross_attn_pos_enc=cross_attn_positional_encoding
+            heads=1,
         ) if shared_gating_layer is None else shared_gating_layer
         
         self.num_context_vectors = num_context_vectors
@@ -736,8 +699,7 @@ class IntegrationConformerBlock(nn.Module):
 
         local_context_vectors = Qs[:, :self.num_context_vectors, :]
 
-        ctx_attn_gating_scores = self.gating_attention(x=local_context_vectors, context=KVs, mask=None, context_mask=None, apply_pos_emb=True)
-        context_info = self.attn1(x=local_context_vectors, context=KVs, mask=None, context_mask=None, gating_mask=ctx_attn_gating_scores) + local_context_vectors
+        context_info = self.attn1(x=local_context_vectors, context=KVs, mask=None, context_mask=None) + local_context_vectors
 
         uQs = Qs.clone() # so we don't break the compute graph
         uQs[:, :self.num_context_vectors, :] = context_info 
@@ -762,37 +724,24 @@ class CrossConformerBlock(nn.Module):
         conv_kernel_size = 31,
         attn_dropout = 0.,
         ff_dropout = 0.,
-        conv_dropout = 0.,
-        sparse_topk = None,
-        conv_norm_type = 'batch_norm',
+        conv_dropout = 0.
     ):
         super().__init__()
         self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-        self.ff1KV = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-
-        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout, sparse_topk = sparse_topk)
-        self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type)
-        self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type)
-
+        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
+        self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout)
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
         self.attn = PreNorm(dim, self.attn)
         self.ff1 = Scale(0.5, PreNorm(dim, self.ff1))
-        self.ff1KV = Scale(0.5, PreNorm(dim, self.ff1KV))
-
         self.ff2 = Scale(0.5, PreNorm(dim, self.ff2))
 
         self.post_norm = nn.LayerNorm(dim)
 
     def forward(self, x, context):
         x = self.ff1(x) + x
-        context = self.ff1KV(context) + context
-
-        x = self.conv(x) + x
-        context = self.convKV(context) + context
-
         x = self.attn(x, context=context) + x
-        
+        x = self.conv(x) + x
         x = self.ff2(x) + x
         x = self.post_norm(x)
         return x
