@@ -33,7 +33,7 @@ from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, N
 
 from torch.utils.checkpoint import checkpoint # gradient/activation checkpointing
 from nemo.collections.asr.parts.submodules.lucid_conformer import CrossAttnHistoryPositionalEncoding, CrossConformerBlock
-
+from einops import rearrange
 
 __all__ = ['CrossCtxConformerEncoder']
 
@@ -140,8 +140,11 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         checkpoint_every_n_layers=1,
         num_memory_vectors=10,
         num_repeats = 6,
+        max_seq_len = 40, # max batch size for cross-batch attention position encoding
         sparse_topk = None,
-        memory_dropout = 0.25
+        memory_dropout = 0.0,
+        cross_attn_dropout = 0.0,
+        cross_post_attn_dropout = 0.1,
     ):
         super().__init__()
 
@@ -242,7 +245,7 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
      
         self.cross_attn_pos_enc = CrossAttnHistoryPositionalEncoding( 
             pos_dim=d_model,
-            max_seq_len=40,
+            max_seq_len=max_seq_len,
             num_context_vectors=num_memory_vectors
         )
      
@@ -251,7 +254,7 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
             dim_head = d_model // n_heads,
             heads = n_heads,
             ff_mult = ff_expansion_factor,
-            attn_dropout = dropout_att,
+            attn_dropout = cross_post_attn_dropout,
             ff_dropout = dropout,
             sparse_topk = sparse_topk,
             conv_norm_type = conv_norm_type
@@ -260,6 +263,7 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         self.num_repeats = num_repeats
 
         self.memory_dropout = nn.Dropout(memory_dropout)
+        self.cross_attn_dropout = cross_attn_dropout
 
         self.num_memory_vectors = num_memory_vectors
         self.memory_vectors = nn.Parameter(torch.Tensor(num_memory_vectors, d_model))
@@ -298,6 +302,31 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
     def forward(self, audio_signal, length=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_for_export(audio_signal=audio_signal, length=length)
+
+    def apply_cross_attend_dropout(self, x):
+        '''
+        cross-attend dropout used here: https://arxiv.org/pdf/2202.07765.pdf
+        this is basically a random selection of elements in the input tensor
+        i.e if the input tensor is (B, N, D) and the cross attend dropout is
+        0.25 then output will be (B, N*0.75, D)
+        Wan't sure how to implement this efficiently so used lucidrains implementation from the perceiver AR 
+        https://github.com/lucidrains/perceiver-ar-pytorch/blob/main/perceiver_ar_pytorch/perceiver_ar_pytorch.py
+        '''
+        cross_attn_dropout = self.cross_attn_dropout
+        # check if model is training or not
+        if cross_attn_dropout > 0 and self.training:
+            batch_size, num_frames, dim = x.size()
+            rand = torch.zeros((batch_size, num_frames), device=x.device).uniform_()
+            num_frames_to_keep = int(num_frames * (1 - cross_attn_dropout))
+            keep_indices = rand.topk(num_frames_to_keep, dim=-1).indices
+            keep_mask = torch.zeros_like(rand).scatter_(1, keep_indices, 1).bool()
+            # dang thats clean
+            return rearrange(x[keep_mask], '(b n) d -> b n d', b=batch_size)
+        else:
+            return x
+            
+            
+            
 
     @typecheck()
     def forward_for_export(self, audio_signal, length):
@@ -360,8 +389,10 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
             memory_sequences = memory_sequences.repeat(audio_signal.size(0), 1, 1)
             # apply relative cross attn positional encoding to the memory sequences
             memory_sequences = self.cross_attn_pos_enc(memory_sequences)
-            # dropout (0.25) of the memory vectors (may need tuning)
+            # dropout of memory sequences (not usin here anymore) but kept for compatibility
             memory_sequences = self.memory_dropout(memory_sequences)
+            # cross attend dropout
+            memory_sequences = self.apply_cross_attend_dropout(memory_sequences)
             # now cross attention between memory vectors and memory sequences
             ctx_memories = checkpoint(self.create_custom_forward(self.cross_conformer_layer), memory_vectors, memory_sequences)
             # re-connect the memory vectors to the audio_signal, but clone so we don't break the computation graph
