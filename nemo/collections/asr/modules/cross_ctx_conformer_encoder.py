@@ -145,8 +145,16 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         memory_dropout = 0.0,
         cross_attn_dropout = 0.0,
         cross_post_attn_dropout = 0.1,
+        doposbefore=False, # compatibility 
+        local_attn=False # whether to use a local attention pattern for the cross-attention
     ):
         super().__init__()
+
+        assert local_attn == False or cross_attn_dropout == 0.0, "local attention is not compatible with cross attention dropout (to do!)"
+        if local_attn:
+            print('Using local attention for cross-attention')
+
+        self.doposbefore = doposbefore
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -257,7 +265,8 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
             attn_dropout = cross_post_attn_dropout,
             ff_dropout = dropout,
             sparse_topk = sparse_topk,
-            conv_norm_type = conv_norm_type
+            conv_norm_type = conv_norm_type,
+            local_attn = local_attn
         )
 
         self.num_repeats = num_repeats
@@ -309,7 +318,7 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         this is basically a random selection of elements in the input tensor
         i.e if the input tensor is (B, N, D) and the cross attend dropout is
         0.25 then output will be (B, N*0.75, D)
-        Wan't sure how to implement this efficiently so used lucidrains implementation from the perceiver AR 
+        Wasn't sure how to implement this efficiently so used lucidrains implementation from the perceiver AR 
         https://github.com/lucidrains/perceiver-ar-pytorch/blob/main/perceiver_ar_pytorch/perceiver_ar_pytorch.py
         '''
         cross_attn_dropout = self.cross_attn_dropout
@@ -347,12 +356,16 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         else:
             audio_signal, length = self.pre_encode(audio_signal, length)
 
-        audio_signal, pos_emb = self.pos_enc(audio_signal)
         # adjust size
         max_audio_length = audio_signal.size(1)
         max_audio_length += self.num_memory_vectors
         length += self.num_memory_vectors
+
+        if self.doposbefore==True: # for compatibility 
+            audio_signal, pos_emb = self.pos_enc(audio_signal)
         audio_signal = torch.cat([self.memory_vectors.unsqueeze(0).repeat([audio_signal.size(0), 1, 1]), audio_signal], dim=1)
+        if self.doposbefore==False:
+            audio_signal, pos_emb = self.pos_enc(audio_signal)
 
         # Create the self-attention and padding masks
 
@@ -369,9 +382,6 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
             pad_mask = ~pad_mask
         else:
             pad_mask = None
-
-
-        ########################
 
         for lth, layer in enumerate(self.layers):
             if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:

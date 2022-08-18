@@ -16,6 +16,9 @@ from nemo.collections.asr.parts.submodules.x_transformers_local import CrossAtte
 def exists(val):
     return val is not None
 
+def notexists(val):
+    return not exists(val)
+
 def default(val, d):
     return val if exists(val) else d
 
@@ -70,7 +73,49 @@ class PreNorm(nn.Module):
         return self.fn(x, **kwargs)
 
 
+class LocalAttentionMasking(nn.Module):
+    def __init__(self, pattern:str='1, 4, 8, *'):
+        super().__init__()
+        self.pattern = [int(el) if el != '*' else '*' for el in [x.strip() for x in pattern.split(',')]]
+        self.cache = None # cache mask so can reuse for the same input (if the batch size is the same)
 
+    def create_local_mask(self, mem_vecs:int=10, batch_size:int=32, look_backward:int=1, causal:bool=False) -> torch.Tensor:
+        """
+        Creates mask for naive local attention (doesn't save any memory)
+        """
+        look_forward = 0 if causal else look_backward
+        mask = torch.arange(0, batch_size).unsqueeze(0).repeat(batch_size, 1).repeat_interleave(mem_vecs, 1) - torch.arange(0, batch_size).unsqueeze(1)
+        mask = mask.unsqueeze(1).repeat(1, mem_vecs, 1)
+        mask = torch.where( (mask < look_forward + 1) & (mask > -look_backward - 1), torch.tensor(1), torch.tensor(0))
+        return mask.bool()
+
+    def create_head_specific_masks(self, mem_vecs:int=10, batch_size:int=32):
+        """
+        Creates mask for naive local attention specific to each head
+        pattern determines lookahead and lookback values for each head (* means no masking)
+        """
+        masks = []
+        for ptn in self.pattern:
+            if ptn == '*':
+                masks.append(torch.ones(batch_size, mem_vecs, mem_vecs*batch_size).bool())
+            else:
+                look_backward = ptn
+                mask = self.create_local_mask(mem_vecs, batch_size, look_backward, causal=False)
+                masks.append(mask)
+        return torch.stack(masks, dim=1)
+
+    def forward(self, x):
+        '''
+        apply mask to x (x is post-dot product but pre-softmax)
+        '''
+        if exists(self.cache) and self.cache.shape == x.shape[1:]:
+            mask = self.cache
+        else:
+            mask = self.create_head_specific_masks(mem_vecs=x.shape[-2], batch_size=x.shape[0])
+            self.cache = mask
+        mask_val = -torch.finfo(x.dtype).max
+        mask = mask.to(x.device)
+        return x.masked_fill(~mask, mask_val)
 
 class Attention(nn.Module):
     def __init__(
@@ -81,7 +126,9 @@ class Attention(nn.Module):
         dropout = 0.,
         sparse_topk = None,
         max_pos_emb = 256,
-        rel_pos_emb = None
+        rel_pos_emb = None,
+        local_attn = False,
+        local_attn_pattern = '1, 4, 8, *'
     ):
         super().__init__()
         inner_dim = dim_head * heads
@@ -92,11 +139,15 @@ class Attention(nn.Module):
         self.to_out = nn.Linear(inner_dim, dim)
 
         self.sparse_topk = sparse_topk
-
         self.max_pos_emb = max_pos_emb
         self.rel_pos_emb = rel_pos_emb
-
         self.dropout = nn.Dropout(dropout)
+
+        self.local_attn = local_attn
+        if local_attn:
+            assert len(local_attn_pattern.split(',')) == self.heads, f'local_attn_pattern must have {self.heads} heads'
+            self.local_attn_mask = LocalAttentionMasking(local_attn_pattern)
+
 
     def forward(self, x, context = None, mask = None, context_mask = None, gating_mask=None):
         n, device, h, max_pos_emb, has_context = x.shape[-2], x.device, self.heads, self.max_pos_emb, exists(context)
@@ -112,7 +163,6 @@ class Attention(nn.Module):
             seq = torch.arange(n, device = device)
             dist = rearrange(seq, 'i -> i ()') - rearrange(seq, 'j -> () j') + max_pos_emb
             dist = dist.clamp(0, max_pos_emb - 1)
-            
             rel_pos_emb = self.rel_pos_emb(dist).to(q)
             pos_attn = einsum('b h n d, n r d -> b h n r', q, rel_pos_emb) * self.scale
             dots = dots + pos_attn
@@ -130,6 +180,9 @@ class Attention(nn.Module):
             mask = dots < vk
             dots.masked_fill_(mask, -torch.finfo(dots.dtype).max)
             del mask
+
+        if self.local_attn:
+            dots = self.local_attn_mask(dots)
 
         attn = dots.softmax(dim = -1)
 
@@ -764,13 +817,14 @@ class CrossConformerBlock(nn.Module):
         ff_dropout = 0.,
         conv_dropout = 0.,
         sparse_topk = None,
-        conv_norm_type = 'batch_norm',
+        conv_norm_type = 'group_norm',
+        local_attn = False
     ):
         super().__init__()
         self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
         self.ff1KV = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 
-        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout, sparse_topk = sparse_topk)
+        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout, sparse_topk = sparse_topk, local_attn=local_attn)
         self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type)
         self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type)
 
