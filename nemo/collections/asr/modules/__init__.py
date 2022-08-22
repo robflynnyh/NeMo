@@ -31,6 +31,8 @@ from nemo.collections.asr.modules.folded_scconformer_encoder import FoldedSelfCo
 
 from nemo.collections.asr.modules.cross_ctx_conformer_encoder import CrossCtxConformerEncoder
 
+from nemo.collections.asr.modules.ctx_conformer_encoder import CtxConformerEncoder
+
 from nemo.collections.asr.modules.conformer_encoder_grouped_attention import GroupedConformerEncoder
 
 from nemo.collections.asr.modules.conv_asr import (

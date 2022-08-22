@@ -41,36 +41,17 @@ class GLU(nn.Module):
         out, gate = x.chunk(2, dim=self.dim)
         return out * gate.sigmoid()
 
-
-# attention, feedforward, and conv module
-
-class WSConv1d(nn.Conv1d):
-
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
-                 padding=0, dilation=1, groups=1, bias=True):
-        super(WSConv1d, self).__init__(in_channels, out_channels, kernel_size, stride,
-                 padding, dilation, groups, bias)
-
-    def forward(self, x):
-        weight = self.weight
-        weight_mean = weight.mean(dim=1, keepdim=True).mean(dim=2,
-                                  keepdim=True)
-        weight = weight - weight_mean
-        std = weight.view(weight.size(0), -1).std(dim=1).view(-1, 1, 1) + 1e-5
-        weight = weight / std.expand_as(weight)
-        return F.conv1d(x, weight, self.bias, self.stride,
-                        self.padding, self.dilation, self.groups)
-
 class DepthWiseConv1d(nn.Module):
-    def __init__(self, chan_in, chan_out, kernel_size, padding, weight_standardize=False):
+    def __init__(self, chan_in, chan_out, kernel_size, padding):
         super().__init__()
         self.padding = padding
-        convtype = WSConv1d if weight_standardize else nn.Conv1d
-        self.conv = convtype(chan_in, chan_out, kernel_size, groups = chan_in)
+        self.conv = nn.Conv1d(chan_in, chan_out, kernel_size, groups = chan_in)
 
     def forward(self, x):
         x = F.pad(x, self.padding)
         return self.conv(x)
+
+# attention, feedforward, and conv module
 
 class Scale(nn.Module):
     def __init__(self, scale, fn):
@@ -288,8 +269,7 @@ class ConformerConvModule(nn.Module):
         expansion_factor = 2,
         kernel_size = 31,
         dropout = 0.,
-        conv_norm_type = 'batch_norm',
-        weight_standardize = False
+        conv_norm_type = 'batch_norm'
         ):
         super().__init__()
 
@@ -307,7 +287,7 @@ class ConformerConvModule(nn.Module):
             Rearrange('b n c -> b c n'),
             nn.Conv1d(dim, inner_dim * 2, 1),
             GLU(dim=1),
-            DepthWiseConv1d(inner_dim, inner_dim, kernel_size = kernel_size, padding = padding, weight_standardize=weight_standardize),
+            DepthWiseConv1d(inner_dim, inner_dim, kernel_size = kernel_size, padding = padding),
             norm_type(inner_dim) if not causal else nn.Identity(),
             Swish(),
             nn.Conv1d(inner_dim, dim, 1),
@@ -474,108 +454,6 @@ class GroupedConformerBlock(nn.Module):
         x = self.post_norm(x)
         return x, grouped_mask, rotary_pos_emb
 
-
-class CtxConformerBlock(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        dim_head = 64,
-        heads = 8,
-        ff_mult = 4,
-        conv_expansion_factor = 1,
-        conv_kernel_size = 31,
-        attn_dropout = 0.,
-        ff_dropout = 0.,
-        conv_dropout = 0.,
-        conv_norm_type='group_norm',
-        num_mem_tokens = 10
-    ):
-        super().__init__()
-        self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
-        self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type=conv_norm_type, weight_standardize=True)
-        self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-
-        self.num_mem_tokens = num_mem_tokens
-
-        self.attn = PreNorm(dim, self.attn)
-        self.ff1 = Scale(0.5, PreNorm(dim, self.ff1))
-        self.ff2 = Scale(0.5, PreNorm(dim, self.ff2))
-
-        self.post_norm = nn.LayerNorm(dim)
-
-    @staticmethod
-    def slice_mem_tokens(x, num_mem_tokens):
-        return x[:, :num_mem_tokens, :], x[:, num_mem_tokens:, :]
-
-    def forward(self, x, mask = None):
-        x = self.ff1(x) + x
-
-        mem_tokens, acoustics = self.slice_mem_tokens(x, self.num_mem_tokens)
-        acoustics = self.conv(acoustics) + acoustics
-
-        x = torch.cat([mem_tokens, acoustics], dim = 1)
-        x = self.attn(x, mask = mask) + x
-
-        x = self.ff2(x) + x
-        x = self.post_norm(x)
-        return x
-
-
-class CtxCrossConformerBlock(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        dim_head = 64,
-        heads = 8,
-        ff_mult = 4,
-        conv_expansion_factor = 1,
-        conv_kernel_size = 31,
-        attn_dropout = 0.,
-        ff_dropout = 0.,
-        conv_dropout = 0.,
-        sparse_topk = None,
-        conv_norm_type = 'group_norm',
-        local_attn = False,
-        use_conv = False
-    ):
-        super().__init__()
-        self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-        self.ff1KV = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-
-        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout, sparse_topk = sparse_topk, local_attn=local_attn)
-        
-        self.use_conv = use_conv
-        if use_conv:
-            self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=True)
-            self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=True)
-
-        self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-
-        self.attn = PreNorm(dim, self.attn)
-        self.ff1 = Scale(0.5, PreNorm(dim, self.ff1))
-        self.ff1KV = Scale(0.5, PreNorm(dim, self.ff1KV))
-
-        self.ff2 = Scale(0.5, PreNorm(dim, self.ff2))
-
-        self.post_norm = nn.LayerNorm(dim)
-
-
-    def forward(self, x, context):
-        x = self.ff1(x) + x
-        context = self.ff1KV(context) + context
-
-        if self.use_conv:
-            x = self.conv(x) + x
-            context = self.convKV(context) + context
-
-        x = self.attn(x, context=context) + x
-        
-        x = self.ff2(x) + x
-        x = self.post_norm(x)
-        return x
 
 # Conformer Block
 
