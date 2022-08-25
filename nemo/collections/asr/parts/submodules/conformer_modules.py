@@ -29,6 +29,8 @@ from nemo.utils import logging
 
 __all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer', 'CrossConformerLayer']
 
+def exists(x):
+    return x is not None
 
 class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
     """A single block of the Conformer encoder.
@@ -56,6 +58,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         pos_bias_v=None,
         sparse_topk=None,
         weight_standardization=False,
+        num_memory_vectors=None,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -72,6 +75,12 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         # convolution module
         self.norm_conv = LayerNorm(d_model)
         self.conv = ConformerConvolution(d_model=d_model, kernel_size=conv_kernel_size, norm_type=conv_norm_type, weight_standardization=weight_standardization)
+
+        self.num_memory_vectors = num_memory_vectors
+        if self.num_memory_vectors:
+            self.norm_mem_vecs_conv = LayerNorm(d_model)
+            mem_kernel = self.num_memory_vectors // 3
+            self.conv_mem_vecs = ConformerConvolution(d_model=d_model, kernel_size=mem_kernel, norm_type=conv_norm_type, weight_standardization=weight_standardization)
 
         # multi-headed self-attention module
         self.norm_self_att = LayerNorm(d_model)
@@ -90,6 +99,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         # second feed forward module
         self.norm_feed_forward2 = LayerNorm(d_model)
         self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+
 
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
@@ -123,16 +133,21 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         residual = residual + self.dropout(x)
 
         conv_pad_mask = pad_mask
-        if num_memory_vectors != None: # slice out memory vectors from the input to the convolution layer
+        if exists(num_memory_vectors): # slice out memory vectors from the input to the convolution layer
             mem_vecs, residual = self.slice_mem_tokens(residual, num_memory_vectors)
             conv_pad_mask = pad_mask[:, num_memory_vectors:]
+
+        if exists(self.num_memory_vectors):
+            i_mem = self.norm_mem_vecs_conv(mem_vecs)
+            i_mem = self.conv_mem_vecs(i_mem)
+            mem_vecs = self.dropout(i_mem) + mem_vecs
 
         x = self.norm_conv(residual)
         x = self.conv(x, conv_pad_mask)
 
         residual = residual + self.dropout(x)
 
-        if num_memory_vectors != None: # concatenate memory vectors to the output of the convolution layer
+        if exists(num_memory_vectors): # concatenate memory vectors to the output of the convolution layer
             residual = torch.cat([mem_vecs, residual], dim=1)
 
         x = self.norm_feed_forward2(residual)

@@ -532,14 +532,15 @@ class CtxCrossConformerBlock(nn.Module):
         heads = 8,
         ff_mult = 4,
         conv_expansion_factor = 1,
-        conv_kernel_size = 31,
+        conv_kernel_size = 3,
         attn_dropout = 0.,
         ff_dropout = 0.,
         conv_dropout = 0.,
         sparse_topk = None,
         conv_norm_type = 'group_norm',
         local_attn = False,
-        use_conv = False
+        use_conv = True,
+        weight_standardization = True,
     ):
         super().__init__()
         self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
@@ -549,8 +550,8 @@ class CtxCrossConformerBlock(nn.Module):
         
         self.use_conv = use_conv
         if use_conv:
-            self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=True)
-            self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=True)
+            self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=weight_standardization)
+            self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=weight_standardization)
 
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 

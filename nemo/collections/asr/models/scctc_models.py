@@ -492,6 +492,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "sample_lengths": NeuralType(tuple('B'), LengthsType(), optional=True),
             "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True)
         }
 
@@ -507,7 +508,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None, segment_lengths=None
     ):
         """
         Forward pass of the model.
@@ -546,6 +547,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         magnitude_loss = None
+        
         if self.is_compositonal == False:
             encoded, iterim_posteriors, encoded_len = self.encoder(
                 audio_signal=processed_signal, 
@@ -553,7 +555,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
                 length=processed_signal_length
             )
             log_probs = self.decoder(encoder_output=encoded, logits=False)
-        else:
+        else: # this is old code need to DELETE :D
             encoded, iterim_posteriors, iterim_logits_stack, magnitude_loss, encoded_len = self.encoder(
                 audio_signal=processed_signal, 
                 decoder=self.decoder, 
