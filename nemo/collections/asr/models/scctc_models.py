@@ -101,7 +101,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             log_prediction=self._cfg.get("log_prediction", False),
         )
 
-        self.is_compositonal = self._cfg.get("is_compositonal", False)
+        #self.is_compositonal = self._cfg.get("is_compositonal", False)
 
         # Setup optional Optimization flags
         self.setup_optimization_flags()
@@ -492,7 +492,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-            "sample_lengths": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "segment_lens": NeuralType(tuple('S'), LengthsType(), optional=True),
             "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True)
         }
 
@@ -508,7 +508,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None, segment_lengths=None
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None, segment_lens=None
     ):
         """
         Forward pass of the model.
@@ -546,24 +546,19 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        magnitude_loss = None
+        magnitude_loss = None # old
         
-        if self.is_compositonal == False:
-            encoded, iterim_posteriors, encoded_len = self.encoder(
-                audio_signal=processed_signal, 
-                decoder=self.decoder, 
-                length=processed_signal_length
-            )
-            log_probs = self.decoder(encoder_output=encoded, logits=False)
-        else: # this is old code need to DELETE :D
-            encoded, iterim_posteriors, iterim_logits_stack, magnitude_loss, encoded_len = self.encoder(
-                audio_signal=processed_signal, 
-                decoder=self.decoder, 
-                length=processed_signal_length
-            )
-            final_logits = self.decoder(encoder_output=encoded, logits=True)
-            all_logits = iterim_logits_stack + final_logits if iterim_logits_stack is not None else final_logits # if n repeats = 1 then iterim_logits_stack = 0 i.e we only use final_logits
-            log_probs = torch.log_softmax(all_logits, dim=-1)
+        encoder_args = {
+            'audio_signal': processed_signal, 
+            'decoder':self.decoder, 
+            'length':processed_signal_length,
+            'segment_lens':segment_lens
+        }
+        encoder_args = {k: v for k, v in encoder_args.items() if v is not None}
+
+        encoded, iterim_posteriors, encoded_len = self.encoder(**encoder_args)
+        log_probs = self.decoder(encoder_output=encoded, logits=False)
+
 
         
         greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)

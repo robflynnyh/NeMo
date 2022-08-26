@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from nemo.collections.asr.parts.submodules.x_transformers_local import CrossAttender, Attention as xAttention
-
+from inspect import isfunction
 
 # helper functions
 
@@ -20,7 +20,9 @@ def notexists(val):
     return not exists(val)
 
 def default(val, d):
-    return val if exists(val) else d
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
 
 def calc_same_padding(kernel_size):
     pad = kernel_size // 2
@@ -44,6 +46,7 @@ class GLU(nn.Module):
 
 # attention, feedforward, and conv module
 
+# Weight Standardization for 1D Conv layers
 class WSConv1d(nn.Conv1d):
 
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
@@ -186,12 +189,14 @@ class Attention(nn.Module):
             pos_attn = einsum('b h n d, n r d -> b h n r', q, rel_pos_emb) * self.scale
             dots = dots + pos_attn
 
-        if exists(mask) or exists(context_mask):
-            mask = default(mask, lambda: torch.ones(*x.shape[:2], device = device))
-            context_mask = default(context_mask, mask) if not has_context else default(context_mask, lambda: torch.ones(*context.shape[:2], device = device))
-            mask_value = -torch.finfo(dots.dtype).max
-            mask = rearrange(mask, 'b i -> b () i ()') * rearrange(context_mask, 'b j -> b () () j')
-            dots.masked_fill_(~mask, mask_value)
+        if any(map(exists, (mask, context_mask))):
+            q_mask = default(mask, lambda: torch.ones(*x.shape[:2], device = device).bool())
+            k_mask = q_mask if not exists(context) else context_mask
+            k_mask = default(k_mask, lambda: torch.ones(*context.shape[:2], device = device).bool())
+            q_mask = rearrange(q_mask, 'b i -> b 1 i 1')
+            k_mask = rearrange(k_mask, 'b j -> b 1 1 j')
+            input_mask = q_mask * k_mask
+            dots.masked_fill_(~input_mask, -torch.finfo(dots.dtype).max)
 
         if exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1]:
             top, _ = dots.topk(self.sparse_topk, dim = -1)
@@ -279,6 +284,7 @@ def layernorm_fn(dim):
 
 def groupnorm_fn(dim, groups=32):
     return nn.GroupNorm(num_groups=groups, num_channels=dim)
+
     
 class ConformerConvModule(nn.Module):
     def __init__(
@@ -302,11 +308,13 @@ class ConformerConvModule(nn.Module):
         elif conv_norm_type == 'group_norm':
             norm_type = groupnorm_fn
 
-        self.net = nn.Sequential(
+        self.net1 = nn.Sequential(
             nn.LayerNorm(dim),
             Rearrange('b n c -> b c n'),
             nn.Conv1d(dim, inner_dim * 2, 1),
-            GLU(dim=1),
+            GLU(dim=1)
+        )
+        self.net2 = nn.Sequential(
             DepthWiseConv1d(inner_dim, inner_dim, kernel_size = kernel_size, padding = padding, weight_standardize=weight_standardize),
             norm_type(inner_dim) if not causal else nn.Identity(),
             Swish(),
@@ -315,8 +323,17 @@ class ConformerConvModule(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x):
-        return self.net(x)
+    @staticmethod
+    def mask_padding(x, pad_mask):
+        if pad_mask is not None:
+            x.masked_fill_(pad_mask.unsqueeze(1), 0)
+        return x
+
+    def forward(self, x, pad_mask=None):
+        x = self.net1(x)
+        x = self.mask_padding(x, pad_mask)
+        x = self.net2(x)
+        return x
 
 class GroupedConformerBlock(nn.Module):
     '''
@@ -564,15 +581,15 @@ class CtxCrossConformerBlock(nn.Module):
         self.post_norm = nn.LayerNorm(dim)
 
 
-    def forward(self, x, context):
+    def forward(self, x, context, mask = None, context_mask = None):
         x = self.ff1(x) + x
         context = self.ff1KV(context) + context
 
         if self.use_conv:
-            x = self.conv(x) + x
-            context = self.convKV(context) + context
+            x = self.conv(x, pad_mask=mask) + x
+            context = self.convKV(context, pad_mask=context_mask) + context
 
-        x = self.attn(x, context=context) + x
+        x = self.attn(x, context=context, mask = mask, context_mask = context_mask) + x
         
         x = self.ff2(x) + x
         x = self.post_norm(x)
@@ -811,20 +828,37 @@ class CrossAttnHistoryPositionalEncoding(nn.Module):
         if self.max_seq_len % 2 != 0: 
             self.max_seq_len += 1 # make it even
 
+        self.halfpoint = self.max_seq_len // 2
+
         self.embedding = nn.Embedding(max_seq_len, pos_dim) 
         self.embedding.weight.data.uniform_(-0.1, 0.1)
+        
+        self.pos_embs = None
+
+    def clear(self):
+        self.pos_embs = None
+    
+    def create_sequence_pos_matrix(self, segment_length, max_segment_length):
+        halfpoint = self.halfpoint
+        pos_matrix = torch.arange(0, max_segment_length).unsqueeze(0).repeat(segment_length, 1) - torch.arange(0, segment_length).unsqueeze(1) + halfpoint
+        pos_matrix = pos_matrix.clamp(min=0, max=self.max_seq_len - 1).repeat_interleave(self.num_context_vectors, dim=1).long()
+        return pos_matrix
+
+    def init_batch_pos_embs(self, segment_lengths, device, mem_mask=None):
+        pos_matrices = [self.create_sequence_pos_matrix(segment_length, max(segment_lengths)) for segment_length in segment_lengths]
+        pos_matrices = torch.cat(pos_matrices, dim=0).to(device)
+        pos_embs = self.embedding(pos_matrices)
+        if mem_mask is not None:
+            assert mem_mask.shape[0] == pos_embs.shape[0] and mem_mask.shape[1] == pos_embs.shape[1], 'mem_mask and pos_embs have different shapes !'
+            if len(mem_mask.shape) == 2:
+                mem_mask = mem_mask.unsqueeze(-1)
+            assert len(mem_mask.shape) == 3, 'mem_mask has wrong shape !'
+            pos_embs.masked_fill_(~mem_mask, 0)
+        self.pos_embs = pos_embs
 
     def forward(self, x):
-        # we're assuming that x is in a continous order along the batch dimension
-        # so the index in the batch dimension is the same as the index in the sequence dimension for the current utterance
-        halfpoint = self.max_seq_len // 2
-        pos_matrix = torch.arange(0, x.shape[0]).unsqueeze(0).repeat(x.shape[0], 1) - torch.arange(0, x.shape[0]).unsqueeze(1) + halfpoint 
-        pos_matrix = pos_matrix.clamp(min=0, max=self.max_seq_len - 1).repeat_interleave(self.num_context_vectors, dim=1).long().to(x.device) 
-
-        pos_embs = self.embedding(pos_matrix)
-        
-    
-        return x + pos_embs 
+        assert self.pos_embs is not None, 'pos_embs is not initialized !'
+        return x + self.pos_embs
 
 
 class IntegrationConformerBlock(nn.Module):

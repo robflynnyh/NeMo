@@ -106,7 +106,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             {
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
                 "decoder": NeuralType(None),
-                "length": NeuralType(tuple('B'), LengthsType())
+                "length": NeuralType(tuple('B'), LengthsType()),
+                "segment_lens": NeuralType(tuple('S'), LengthsType(), optional=True),
             }
         )
 
@@ -298,6 +299,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
 
+        self.pad_vector = torch.zeros(1, d_model)
+
     def set_max_audio_length(self, max_audio_length):
         """
         Sets maximum input length.
@@ -327,6 +330,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         0.25 then output will be (B, N*0.75, D)
         Wasn't sure how to implement this efficiently so used lucidrains implementation from the perceiver AR 
         https://github.com/lucidrains/perceiver-ar-pytorch/blob/main/perceiver_ar_pytorch/perceiver_ar_pytorch.py
+        # need to change this slightly so padding is excluded from the calculation
         '''
         cross_attn_dropout = self.cross_attn_dropout
         # check if model is training or not
@@ -353,13 +357,16 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         return torch.cat((mems, audio_signal), dim=1), interim_log_posterior
 
     @typecheck()
-    def forward(self, audio_signal, decoder, length=None):
+    def forward(self, audio_signal, decoder, length=None, segment_lens=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
-        return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length)
+        return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length, segment_lens=segment_lens)
 
     @typecheck()
-    def forward_for_export(self, audio_signal, decoder, length):
+    def forward_for_export(self, audio_signal, decoder, length, segment_lens):
         max_audio_length: int = audio_signal.size(-1)
+
+        if segment_lens == None:
+            segment_lens = [audio_signal.shape[0]] # assume segment is the entire batch if not specified
 
         if max_audio_length > self.max_audio_length:
             self.set_max_audio_length(max_audio_length)
@@ -413,22 +420,51 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         audio_signal, interim_log_posterior = self.selfconditioning(audio_signal, decoder)
         interim_posteriors.append(interim_log_posterior)
 
-        # this assumes the batch is composed of utterances that are sampled contiguously from a discourse
+        # create indexes and padding masks for cross-utterance attention
+        mem_indexes = []
+        mem_pad_masks = []
+        max_segment_length = max(segment_lens) * self.num_memory_vectors
+        culmulative_segment_lens = [sum(segment_lens[:i])*self.num_memory_vectors for i in range(len(segment_lens))]
+
+        for i, segment_length in enumerate(segment_lens):
+            from_index = 0 if i == 0 else culmulative_segment_lens[i-1]
+            to_index = culmulative_segment_lens[i]
+            cur_indexes = torch.arange(from_index, to_index, dtype=torch.long)
+            topad = max_segment_length - cur_indexes.shape[0]
+            cur_indexes = torch.cat([cur_indexes, torch.LongTensor([-1]*topad)])
+            mem_pad_mask = torch.LongTensor([1]*(to_index-from_index) + [0]*topad)
+            
+            mem_indexes.append(cur_indexes.unsqueeze(0).repeat(segment_length, 1))
+            mem_pad_masks.append(mem_pad_mask.unsqueeze(0).repeat(segment_length, 1))
+
+        mem_padding_masks = torch.cat(mem_pad_masks, dim=0).bool().to(audio_signal.device)
+        mem_indexes = torch.cat(mem_indexes, dim=0).to(audio_signal.device)
+
+        self.cross_attn_pos_enc.init_batch_pos_embs(segment_lens, audio_signal.device, mem_mask=mem_padding_masks.unsqueeze(-1))
+
+        pad_vector = self.pad_vector.to(audio_signal.device)
+    
         for repeat in range(self.num_repeats): 
             # memory vectors are just learnt embeddings that are prepended to the input prior to the first layer
             memory_vectors = audio_signal[:, :self.num_memory_vectors, :]
-            # reshape to (1, num_memory_vectors * batch_size, d_model)
-            memory_sequences = memory_vectors.reshape(1, -1, memory_vectors.size(-1))
-            # duplicate along the batch dimension i.e (1, num_memory_vectors * batch_size, d_model) -> (batch_size, num_memory_vectors * batch_size, d_model)
-            memory_sequences = memory_sequences.repeat(audio_signal.size(0), 1, 1)
+            # rearrane via grouping batch and sequence dimensions
+            memory_sequences = rearrange(memory_vectors, 'b n d -> (b n) d')
+            # cat padding token to use during indexing
+            memory_sequences = torch.cat([memory_sequences, pad_vector], dim=0)
+            # use indexing to get the correct sequence of memory vectors for each segment of utterances
+            memory_sequences = memory_sequences[[mem_indexes]]
             # apply relative cross attn positional encoding to the memory sequences
             memory_sequences = self.cross_attn_pos_enc(memory_sequences)
-            # dropout of memory sequences (not usin here anymore) but kept for compatibility
-            memory_sequences = self.memory_dropout(memory_sequences)
-            # cross attend dropout
+            # cross attend dropout )
             memory_sequences = self.apply_cross_attend_dropout(memory_sequences)
             # now cross attention between memory vectors and memory sequences
-            ctx_memories = checkpoint(self.create_custom_forward(self.cross_conformer_layer), memory_vectors, memory_sequences)
+            ctx_memories = checkpoint(
+                self.create_custom_forward(self.cross_conformer_layer), 
+                memory_vectors, # x
+                memory_sequences, # context
+                None, # x mask
+                mem_padding_masks # context mask
+            )
             # re-connect the memory vectors to the audio_signal, but clone so we don't break the computation graph
             audio_signal = audio_signal.clone()
             audio_signal[:, :self.num_memory_vectors, :] = ctx_memories
