@@ -11,6 +11,8 @@ from einops.layers.torch import Rearrange
 from nemo.collections.asr.parts.submodules.x_transformers_local import CrossAttender, Attention as xAttention
 from inspect import isfunction
 
+from batchrenorm import BatchRenorm1d
+
 # helper functions
 
 def exists(val):
@@ -307,6 +309,8 @@ class ConformerConvModule(nn.Module):
             norm_type = layernorm_fn
         elif conv_norm_type == 'group_norm':
             norm_type = groupnorm_fn
+        elif conv_norm_type == 'batch_renorm':
+            norm_type = BatchRenorm1d
 
         self.net1 = nn.Sequential(
             nn.LayerNorm(dim),
@@ -492,53 +496,6 @@ class GroupedConformerBlock(nn.Module):
         return x, grouped_mask, rotary_pos_emb
 
 
-class CtxConformerBlock(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        dim_head = 64,
-        heads = 8,
-        ff_mult = 4,
-        conv_expansion_factor = 1,
-        conv_kernel_size = 31,
-        attn_dropout = 0.,
-        ff_dropout = 0.,
-        conv_dropout = 0.,
-        conv_norm_type='group_norm',
-        num_mem_tokens = 10
-    ):
-        super().__init__()
-        self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-        self.attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout)
-        self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type=conv_norm_type, weight_standardize=True)
-        self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-
-        self.num_mem_tokens = num_mem_tokens
-
-        self.attn = PreNorm(dim, self.attn)
-        self.ff1 = Scale(0.5, PreNorm(dim, self.ff1))
-        self.ff2 = Scale(0.5, PreNorm(dim, self.ff2))
-
-        self.post_norm = nn.LayerNorm(dim)
-
-    @staticmethod
-    def slice_mem_tokens(x, num_mem_tokens):
-        return x[:, :num_mem_tokens, :], x[:, num_mem_tokens:, :]
-
-    def forward(self, x, mask = None):
-        x = self.ff1(x) + x
-
-        mem_tokens, acoustics = self.slice_mem_tokens(x, self.num_mem_tokens)
-        acoustics = self.conv(acoustics) + acoustics
-
-        x = torch.cat([mem_tokens, acoustics], dim = 1)
-        x = self.attn(x, mask = mask) + x
-
-        x = self.ff2(x) + x
-        x = self.post_norm(x)
-        return x
-
 
 class CtxCrossConformerBlock(nn.Module):
     def __init__(
@@ -550,6 +507,7 @@ class CtxCrossConformerBlock(nn.Module):
         ff_mult = 4,
         conv_expansion_factor = 1,
         conv_kernel_size = 3,
+        convKV_kernel_size = 10,
         attn_dropout = 0.,
         ff_dropout = 0.,
         conv_dropout = 0.,
@@ -557,7 +515,7 @@ class CtxCrossConformerBlock(nn.Module):
         conv_norm_type = 'group_norm',
         local_attn = False,
         use_conv = True,
-        weight_standardization = True,
+        weight_standardization = False,
     ):
         super().__init__()
         self.ff1 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
@@ -568,7 +526,7 @@ class CtxCrossConformerBlock(nn.Module):
         self.use_conv = use_conv
         if use_conv:
             self.conv = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=weight_standardization)
-            self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = conv_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=weight_standardization)
+            self.convKV = ConformerConvModule(dim = dim, causal = False, expansion_factor = conv_expansion_factor, kernel_size = convKV_kernel_size, dropout = conv_dropout, conv_norm_type = conv_norm_type, weight_standardize=weight_standardization)
 
         self.ff2 = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
 

@@ -227,7 +227,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
         self.layers = nn.ModuleList()
-        for i in range(n_layers):
+        for _ in range(n_layers):
             layer = ConformerLayer(
                 d_model=d_model,
                 d_ff=d_ff,
@@ -239,12 +239,11 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 dropout_att=dropout_att,
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
-                weight_standardization=weight_standardization,
-                num_memory_vectors=num_memory_vectors,
+                weight_standardization=weight_standardization
             )
             self.layers.append(layer)
 
-        self.repeated_conformer_layer = ConformerLayer( # full seq layer
+        self.repeated_conformer_layer1 = ConformerLayer( # full seq layer
                 d_model=d_model,
                 d_ff=d_ff,
                 self_attention_model=self_attention_model,
@@ -256,8 +255,22 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
                 sparse_topk = sparse_topk,
-                weight_standardization=weight_standardization,
-                num_memory_vectors=num_memory_vectors,
+                weight_standardization=weight_standardization
+        )
+
+        self.repeated_conformer_layer2 = ConformerLayer( # full seq layer
+                d_model=d_model,
+                d_ff=d_ff,
+                self_attention_model=self_attention_model,
+                n_heads=n_heads,
+                conv_kernel_size=conv_kernel_size,
+                conv_norm_type=conv_norm_type,
+                dropout=dropout,
+                dropout_att=dropout_att,
+                pos_bias_u=pos_bias_u,
+                pos_bias_v=pos_bias_v,
+                sparse_topk = sparse_topk,
+                weight_standardization=weight_standardization
         )
      
         self.cross_attn_pos_enc = CrossAttnHistoryPositionalEncoding( 
@@ -271,6 +284,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             dim_head = d_model // n_heads,
             heads = n_heads,
             ff_mult = ff_expansion_factor,
+            conv_kernel_size = num_memory_vectors // 3,
+            convKV_kernel_size = num_memory_vectors,
             attn_dropout = cross_post_attn_dropout,
             ff_dropout = dropout,
             sparse_topk = sparse_topk,
@@ -335,6 +350,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         cross_attn_dropout = self.cross_attn_dropout
         # check if model is training or not
         if cross_attn_dropout > 0 and self.training:
+            raise NotImplementedError # not workin now because padding also needs to be dropped
+
             batch_size, num_frames, dim = x.size()
             rand = torch.zeros((batch_size, num_frames), device=x.device).uniform_()
             num_frames_to_keep = int(num_frames * (1 - cross_attn_dropout))
@@ -413,7 +430,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:
                 audio_signal = checkpoint(self.create_custom_forward(layer), audio_signal, att_mask, pos_emb, pad_mask, self.num_memory_vectors)
             else:
-                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask, num_memory_vectors=self.num_memory_vectors)
+                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
         
         interim_posteriors = []
 
@@ -431,7 +448,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             to_index = culmulative_segment_lens[i]
             cur_indexes = torch.arange(from_index, to_index, dtype=torch.long)
             topad = max_segment_length - cur_indexes.shape[0]
-            cur_indexes = torch.cat([cur_indexes, torch.LongTensor([-1]*topad)])
+            cur_indexes = torch.cat([cur_indexes, torch.LongTensor([-1]*topad)]) # -1 as concatenated padding as the last index
             mem_pad_mask = torch.LongTensor([1]*(to_index-from_index) + [0]*topad)
             
             mem_indexes.append(cur_indexes.unsqueeze(0).repeat(segment_length, 1))
@@ -452,10 +469,10 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             # cat padding token to use during indexing
             memory_sequences = torch.cat([memory_sequences, pad_vector], dim=0)
             # use indexing to get the correct sequence of memory vectors for each segment of utterances
-            memory_sequences = memory_sequences[[mem_indexes]]
+            memory_sequences = memory_sequences[[mem_indexes]] 
             # apply relative cross attn positional encoding to the memory sequences
             memory_sequences = self.cross_attn_pos_enc(memory_sequences)
-            # cross attend dropout )
+            # cross attend dropout (needs fixingt TODO)
             memory_sequences = self.apply_cross_attend_dropout(memory_sequences)
             # now cross attention between memory vectors and memory sequences
             ctx_memories = checkpoint(
@@ -469,12 +486,15 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             audio_signal = audio_signal.clone()
             audio_signal[:, :self.num_memory_vectors, :] = ctx_memories
             # now for self attention over the audio_signal with the cross-utterance memory vectors
+            
+            audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer1), audio_signal, att_mask, pos_emb, pad_mask)
+            
             if repeat != self.num_repeats - 1:
-                audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer), audio_signal, att_mask, pos_emb, pad_mask, self.num_memory_vectors)
+                audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer2), audio_signal, att_mask, pos_emb, pad_mask)
                 audio_signal, interim_log_posterior = self.selfconditioning(audio_signal, decoder) # SC-CTC
                 interim_posteriors.append(interim_log_posterior)
             else: # don't checkpoint grad on last layer
-                audio_signal = self.repeated_conformer_layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask, num_memory_vectors=self.num_memory_vectors)
+                audio_signal = self.repeated_conformer_layer2(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
         
         #########################
 

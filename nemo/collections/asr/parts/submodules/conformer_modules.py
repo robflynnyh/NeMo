@@ -27,6 +27,8 @@ from nemo.core.classes.mixins import AccessMixin
 from nemo.core.classes.mixins.adapter_mixins import AdapterModuleMixin
 from nemo.utils import logging
 
+from batchrenorm import BatchRenorm1d
+
 __all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer', 'CrossConformerLayer']
 
 def exists(x):
@@ -217,6 +219,8 @@ class ConformerConvolution(nn.Module):
             self.batch_norm = nn.LayerNorm(d_model)
         elif norm_type == 'group_norm':
             self.batch_norm = nn.GroupNorm(num_groups=32, num_channels=d_model)
+        elif norm_type == 'batch_renorm':
+            self.batch_norm = BatchRenorm1d(d_model)
         else:
             raise ValueError(f"conv_norm_type={norm_type} is not valid!")
 
