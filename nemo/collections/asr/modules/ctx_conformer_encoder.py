@@ -153,7 +153,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         cross_post_attn_dropout = 0.1,
         local_attn=False, # whether to use a local attention pattern for the cross-attention
         weight_standardization=True,
-        self_condition=True
+        self_condition=True,
+        include_mems_in_conv=False
     ):
         super().__init__()
 
@@ -161,6 +162,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         if local_attn:
             print('Using local attention for cross-attention')
 
+        self.include_mems_in_conv = include_mems_in_conv
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -427,11 +429,13 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         else:
             pad_mask = None
 
+        mems_in_conv = None if self.include_mems_in_conv == False else self.num_memory_vectors # whether to include the memory vectors in the conformal convolution modules
+
         for lth, layer in enumerate(self.layers):
             if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:
-                audio_signal = checkpoint(self.create_custom_forward(layer), audio_signal, att_mask, pos_emb, pad_mask, self.num_memory_vectors)
+                audio_signal = checkpoint(self.create_custom_forward(layer), audio_signal, att_mask, pos_emb, pad_mask, mems_in_conv)
             else:
-                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask, num_memory_vectors=self.num_memory_vectors)
+                audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask, num_memory_vectors=mems_in_conv)
         
         interim_posteriors = []
 
@@ -488,14 +492,14 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             audio_signal[:, :self.num_memory_vectors, :] = ctx_memories
             # now for self attention over the audio_signal with the cross-utterance memory vectors
             
-            audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer1), audio_signal, att_mask, pos_emb, pad_mask, self.num_memory_vectors)
+            audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer1), audio_signal, att_mask, pos_emb, pad_mask, mems_in_conv)
             
             if repeat != self.num_repeats - 1:
-                audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer2), audio_signal, att_mask, pos_emb, pad_mask, self.num_memory_vectors)
+                audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer2), audio_signal, att_mask, pos_emb, pad_mask, mems_in_conv)
                 audio_signal, interim_log_posterior = self.selfconditioning(audio_signal, decoder) # SC-CTC
                 interim_posteriors.append(interim_log_posterior)
             else: # don't checkpoint grad on last layer
-                audio_signal = self.repeated_conformer_layer2(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask, num_memory_vectors=self.num_memory_vectors)
+                audio_signal = self.repeated_conformer_layer2(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask, num_memory_vectors=mems_in_conv)
         
         #########################
 
