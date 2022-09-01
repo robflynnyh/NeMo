@@ -33,7 +33,7 @@ from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, N
 
 from torch.utils.checkpoint import checkpoint # gradient/activation checkpointing
 from nemo.collections.asr.parts.submodules.lucid_conformer import CrossAttnHistoryPositionalEncoding, CrossConformerBlock
-
+from einops import rearrange
 
 __all__ = ['CrossCtxConformerEncoder']
 
@@ -139,10 +139,22 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         dropout_att=0.0,
         checkpoint_every_n_layers=1,
         num_memory_vectors=10,
-        num_repeats = 3,
-        sparse_topk = 8
+        num_repeats = 6,
+        max_seq_len = 40, # max batch size for cross-batch attention position encoding
+        sparse_topk = None,
+        memory_dropout = 0.0,
+        cross_attn_dropout = 0.0,
+        cross_post_attn_dropout = 0.1,
+        doposbefore=False, # compatibility 
+        local_attn=False # whether to use a local attention pattern for the cross-attention
     ):
         super().__init__()
+
+        assert local_attn == False or cross_attn_dropout == 0.0, "local attention is not compatible with cross attention dropout (to do!)"
+        if local_attn:
+            print('Using local attention for cross-attention')
+
+        self.doposbefore = doposbefore
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -238,44 +250,29 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
                 pos_bias_v=pos_bias_v,
                 sparse_topk = sparse_topk
         )
-
-        self.context_conformer_layer = ConformerLayer( # self-attention applied to context sequence
-                d_model=d_model,
-                d_ff=d_ff,
-                self_attention_model=self_attention_model,
-                n_heads=n_heads,
-                conv_kernel_size=conv_kernel_size,
-                conv_norm_type=conv_norm_type,
-                dropout=dropout,
-                dropout_att=dropout_att,
-                pos_bias_u=pos_bias_u,
-                pos_bias_v=pos_bias_v,
-                sparse_topk = sparse_topk
-        )
-
-        '''
+     
         self.cross_attn_pos_enc = CrossAttnHistoryPositionalEncoding( 
             pos_dim=d_model,
-            max_seq_len=40,
+            max_seq_len=max_seq_len,
             num_context_vectors=num_memory_vectors
         )
-        '''
-
-        '''
+     
         self.cross_conformer_layer = CrossConformerBlock( # cross attention applied between local and global context
             dim = d_model,
             dim_head = d_model // n_heads,
             heads = n_heads,
             ff_mult = ff_expansion_factor,
-            attn_dropout = dropout_att,
+            attn_dropout = cross_post_attn_dropout,
             ff_dropout = dropout,
             sparse_topk = sparse_topk,
+            conv_norm_type = conv_norm_type,
+            local_attn = local_attn
         )
-        '''
 
         self.num_repeats = num_repeats
 
-        self.memory_dropout = nn.Dropout(0.25)
+        self.memory_dropout = nn.Dropout(memory_dropout)
+        self.cross_attn_dropout = cross_attn_dropout
 
         self.num_memory_vectors = num_memory_vectors
         self.memory_vectors = nn.Parameter(torch.Tensor(num_memory_vectors, d_model))
@@ -315,6 +312,31 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_for_export(audio_signal=audio_signal, length=length)
 
+    def apply_cross_attend_dropout(self, x):
+        '''
+        cross-attend dropout used here: https://arxiv.org/pdf/2202.07765.pdf
+        this is basically a random selection of elements in the input tensor
+        i.e if the input tensor is (B, N, D) and the cross attend dropout is
+        0.25 then output will be (B, N*0.75, D)
+        Wasn't sure how to implement this efficiently so used lucidrains implementation from the perceiver AR 
+        https://github.com/lucidrains/perceiver-ar-pytorch/blob/main/perceiver_ar_pytorch/perceiver_ar_pytorch.py
+        '''
+        cross_attn_dropout = self.cross_attn_dropout
+        # check if model is training or not
+        if cross_attn_dropout > 0 and self.training:
+            batch_size, num_frames, dim = x.size()
+            rand = torch.zeros((batch_size, num_frames), device=x.device).uniform_()
+            num_frames_to_keep = int(num_frames * (1 - cross_attn_dropout))
+            keep_indices = rand.topk(num_frames_to_keep, dim=-1).indices
+            keep_mask = torch.zeros_like(rand).scatter_(1, keep_indices, 1).bool()
+            # dang thats clean
+            return rearrange(x[keep_mask], '(b n) d -> b n d', b=batch_size)
+        else:
+            return x
+            
+            
+            
+
     @typecheck()
     def forward_for_export(self, audio_signal, length):
         max_audio_length: int = audio_signal.size(-1)
@@ -334,12 +356,16 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         else:
             audio_signal, length = self.pre_encode(audio_signal, length)
 
-        audio_signal, pos_emb = self.pos_enc(audio_signal)
         # adjust size
         max_audio_length = audio_signal.size(1)
         max_audio_length += self.num_memory_vectors
         length += self.num_memory_vectors
+
+        if self.doposbefore==True: # for compatibility 
+            audio_signal, pos_emb = self.pos_enc(audio_signal)
         audio_signal = torch.cat([self.memory_vectors.unsqueeze(0).repeat([audio_signal.size(0), 1, 1]), audio_signal], dim=1)
+        if self.doposbefore==False:
+            audio_signal, pos_emb = self.pos_enc(audio_signal)
 
         # Create the self-attention and padding masks
 
@@ -357,47 +383,35 @@ class CrossCtxConformerEncoder(NeuralModule, Exportable):
         else:
             pad_mask = None
 
-
-        ########################
-
         for lth, layer in enumerate(self.layers):
             if self.checkpoint_every_n_layers > 0 and lth % self.checkpoint_every_n_layers == 0:
                 audio_signal = checkpoint(self.create_custom_forward(layer), audio_signal, att_mask, pos_emb, pad_mask)
             else:
                 audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
-
-
-        context_conformer_pos_emb = None
-        for repeat in range(self.num_repeats):
+        
+        # this assumes the batch is composed of utterances that are sampled contiguously from a discourse
+        for repeat in range(self.num_repeats): 
+            # memory vectors are just learnt embeddings that are prepended to the input prior to the first layer
             memory_vectors = audio_signal[:, :self.num_memory_vectors, :]
-            # reshape to (1, num_context_seq * batch_size, dim)
+            # reshape to (1, num_memory_vectors * batch_size, d_model)
             memory_sequences = memory_vectors.reshape(1, -1, memory_vectors.size(-1))
-            # duplicate along the batch dimension
+            # duplicate along the batch dimension i.e (1, num_memory_vectors * batch_size, d_model) -> (batch_size, num_memory_vectors * batch_size, d_model)
             memory_sequences = memory_sequences.repeat(audio_signal.size(0), 1, 1)
-            # apply relative positional encoding to the memory sequences
+            # apply relative cross attn positional encoding to the memory sequences
             memory_sequences = self.cross_attn_pos_enc(memory_sequences)
-            # dropout 0.25 of the memory sequences
+            # dropout of memory sequences (not usin here anymore) but kept for compatibility
             memory_sequences = self.memory_dropout(memory_sequences)
-            # apply self attention over the memory sequences
-            if context_conformer_pos_emb == None:
-                memory_sequences, context_conformer_pos_emb = self.pos_enc(memory_sequences)
-            memory_sequences = checkpoint(self.create_custom_forward(self.context_conformer_layer), memory_sequences, None, context_conformer_pos_emb, None)
-            # re-apply the positional encoding to the memory sequences
-            memory_sequences = self.cross_attn_pos_enc(memory_sequences)
+            # cross attend dropout
+            memory_sequences = self.apply_cross_attend_dropout(memory_sequences)
             # now cross attention between memory vectors and memory sequences
             ctx_memories = checkpoint(self.create_custom_forward(self.cross_conformer_layer), memory_vectors, memory_sequences)
-            # re-connect the ctx_memories to the audio_signal, but clone so we don't break the computation graph
-            #if repeat == self.num_repeats - 1:
-            #    import numpy as np
-            #    np.save('ctx_memories.npy', ctx_memories.detach().cpu().numpy())
-            #    np.save('audio_signal.npy', audio_signal[:, self.num_memory_vectors:, :].detach().cpu().numpy())
-            #    exit()
+            # re-connect the memory vectors to the audio_signal, but clone so we don't break the computation graph
             audio_signal = audio_signal.clone()
             audio_signal[:, :self.num_memory_vectors, :] = ctx_memories
-            # now for final self attention over the audio_signal
+            # now for self attention over the audio_signal with the cross-utterance memory vectors
             if repeat != self.num_repeats - 1:
                 audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer), audio_signal, att_mask, pos_emb, pad_mask)
-            else: # don't checkpoint on last layer
+            else: # don't checkpoint grad on last layer
                 audio_signal = self.repeated_conformer_layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
         
         #########################

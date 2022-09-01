@@ -29,12 +29,11 @@ from nemo.collections.asr.modules.folded_scconformer_encoder import FoldedSelfCo
 #from nemo.collections.asr.modules.exp3_ctx_compositional_scconformer_encoder import experiment3
 #from nemo.collections.asr.modules.hierarchical_conformer_encoder import HierarchicalConformerEncoder
 
-from nemo.collections.asr.modules.cross_ctx_conformer_encoder import CrossCtxConformerEncoder
 
 
 from nemo.collections.asr.modules.ctx_conformer_encoder import CtxConformerEncoder
+from nemo.collections.asr.modules.seperated_ctx_conformer_encoder import CtxConformerEncoder as SeparatedCtxConformerEncoder
 
-from nemo.collections.asr.modules.ctx_conformer_encoder_test import CtxConformerEncoder as CtxConformerEncoderTest
 
 from nemo.collections.asr.modules.conformer_encoder_grouped_attention import GroupedConformerEncoder
 

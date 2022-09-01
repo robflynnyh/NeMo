@@ -139,7 +139,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         untie_biases=True,
         pos_emb_max_len=5000,
         conv_kernel_size=31,
-        conv_norm_type='batch_norm',
+        conv_norm_type='group_norm',
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
@@ -154,7 +154,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         local_attn=False, # whether to use a local attention pattern for the cross-attention
         weight_standardization=True,
         self_condition=True,
-        include_mems_in_conv=False
+        include_mems_in_conv=False # whether to include the memory vectors in the self attention conformer convolutional modules
     ):
         super().__init__()
 
