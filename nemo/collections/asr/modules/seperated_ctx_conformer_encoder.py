@@ -153,7 +153,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         local_attn=False, # whether to use a local attention pattern for the cross-attention
         weight_standardization=True,
         self_condition=True,
-        include_mems_in_conv=False # whether to include the memory vectors in the self attention conformer convolutional modules
+        residual_context_gating=None
     ):
         super().__init__()
 
@@ -161,7 +161,19 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         if local_attn:
             print('Using local attention for cross-attention')
 
-        self.include_mems_in_conv = include_mems_in_conv
+        self.residual_context_gating = residual_context_gating
+        if self.residual_context_gating == 'learned_scaler':
+            self.residual_context_gating_scaler = nn.Parameter(torch.tensor(1.0))
+        elif self.residual_context_gating == 'sigmoid_gating':
+            self.residual_context_gating_w1 = nn.Linear(d_model, d_model, bias=False)
+            self.residual_context_gating_w2 = nn.Linear(d_model, d_model, bias=False)
+            self.residual_context_gating_b = nn.Parameter(torch.zeros(d_model))
+        elif self.residual_context_gating == 'adaptive_scaler_mean' or self.residual_context_gating == 'adaptive_scaler_sum':
+            self.residual_context_gating_scaler_projection = nn.Linear(d_model, 1)
+        else:
+            assert self.residual_context_gating is None, f"Unknown residual context gating type {self.residual_context_gating}"
+
+
 
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -333,9 +345,6 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             self.register_buffer('seq_range', seq_range, persistent=False)
         self.pos_enc.extend_pe(max_audio_length, device)
 
-    @staticmethod
-    def get_attn_mask(q_mask, kv_mask):
-        return rearrange(q_mask, 'b i -> b 1 i 1') * rearrange(kv_mask, 'b j -> b 1 1 j')
 
     @staticmethod
     def create_custom_forward(module): # for activation checkpointing 
@@ -379,10 +388,29 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         
         return audio_signal, interim_log_posterior
 
+    def integration_gating(self, context, audio):
+        '''
+        Gates the residual for mapping the context to the audio
+        '''
+        if self.residual_context_gating == None:
+            return context + audio # no gating
+        elif self.residual_context_gating == 'learned_scaler':
+            return context + audio * self.residual_context_gating_scaler
+        elif self.residual_context_gating == 'sigmoid_gating':
+            gating_fn = (self.residual_context_gating_w1(context) + self.residual_context_gating_w2(audio) + self.residual_context_gating_b).sigmoid()
+            return context * gating_fn + audio * (1 - gating_fn)
+        elif self.residual_context_gating == 'adaptive_scaler_mean' or self.residual_context_gating == 'adaptive_scaler_sum':
+            gating_fn = self.residual_context_gating_scaler_projection(audio)
+            gating_fn = gating_fn.mean(dim=1) if self.residual_context_gating == 'adaptive_scaler_mean' else gating_fn.sum(dim=1) # sum or mean across the sequence
+            return context * gating_fn.sigmoid() + audio
+        else:
+            raise Exception('Invalid residual context gating type')
+
     @typecheck()
     def forward(self, audio_signal, decoder, length=None, segment_lens=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_for_export(audio_signal=audio_signal, decoder=decoder, length=length, segment_lens=segment_lens)
+
 
     @typecheck()
     def forward_for_export(self, audio_signal, decoder, length, segment_lens):
@@ -496,13 +524,13 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             )
 
             # map the memory vectors back to the audio signal
-            audio_signal = checkpoint(
+            audio_signal = self.integration_gating(checkpoint(
                 self.create_custom_forward(self.map_memory_to_spectogram),
-                audio_signal, # query vectors
-                memory_vectors, # key/value vectors
-                ~pad_mask, # query mask
-                None # key/value mask
-            ) +  audio_signal # add the audio signal as a residual connection
+                    audio_signal, # query vectors
+                    memory_vectors, # key/value vectors
+                    ~pad_mask, # query mask
+                    None # key/value mask
+            ), audio_signal) # orinal signal included through residual/gating connection
 
             # now for self attention over the audio_signal
     
