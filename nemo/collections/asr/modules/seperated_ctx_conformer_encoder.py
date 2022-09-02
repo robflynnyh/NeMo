@@ -162,7 +162,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             print('Using local attention for cross-attention')
 
         self.residual_context_gating = residual_context_gating
-        if self.residual_context_gating == 'learned_scaler':
+        if self.residual_context_gating == 'learned_scaler' or self.residual_context_gating == 'learned_sigmoid_scaler':
             self.residual_context_gating_scaler = nn.Parameter(torch.tensor(1.0))
         elif self.residual_context_gating == 'sigmoid_gating':
             self.residual_context_gating_w1 = nn.Linear(d_model, d_model, bias=False)
@@ -396,6 +396,9 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             return context + audio # no gating
         elif self.residual_context_gating == 'learned_scaler':
             return context + audio * self.residual_context_gating_scaler
+        elif self.residual_context_gating == 'learned_sigmoid_scaler':
+            gating_fn = self.residual_context_gating_scaler.sigmoid()
+            return context * gating_fn + audio * (1 - gating_fn)
         elif self.residual_context_gating == 'sigmoid_gating':
             gating_fn = (self.residual_context_gating_w1(context) + self.residual_context_gating_w2(audio) + self.residual_context_gating_b).sigmoid()
             return context * gating_fn + audio * (1 - gating_fn)
