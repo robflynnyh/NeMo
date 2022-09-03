@@ -110,7 +110,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
     def slice_mem_tokens(x, num_mem_tokens):
         return x[:, :num_mem_tokens, :], x[:, num_mem_tokens:, :]
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, num_memory_vectors=None):
+    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, num_memory_vectors=None, mem_pos_emb=None):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -127,7 +127,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
 
         x = self.norm_self_att(residual)
         if self.self_attention_model == 'rel_pos':
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb)
+            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb)
         elif self.self_attention_model == 'abs_pos':
             x = self.self_attn(query=x, key=x, value=x, mask=att_mask)
         else:

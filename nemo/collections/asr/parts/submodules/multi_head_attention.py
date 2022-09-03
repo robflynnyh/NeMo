@@ -37,6 +37,10 @@ import math
 import torch
 import torch.nn as nn
 
+
+def exists(val):
+    return val is not None
+
 __all__ = [
     'RelPositionMultiHeadAttention',
     'RelPositionalEncoding',
@@ -130,6 +134,7 @@ class MultiHeadAttention(nn.Module):
             output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
         """
         q, k, v = self.forward_qkv(query, key, value)
+
         scores = torch.matmul(q, k.transpose(-2, -1)) / self.s_d_k
         return self.forward_attention(v, scores, mask)
 
@@ -174,7 +179,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2)
         return x
 
-    def forward(self, query, key, value, mask, pos_emb):
+    def forward(self, query, key, value, mask, pos_emb, mem_pos_emb=None):
         """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
         Args:
             query (torch.Tensor): (batch, time1, size)
@@ -186,6 +191,11 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
             output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
         """
         q, k, v = self.forward_qkv(query, key, value)
+        if exists(mem_pos_emb):
+            b, n, d = mem_pos_emb.size()
+            mem_pos_emb = mem_pos_emb.view(b, self.h, n, d // self.h)
+            q = q + mem_pos_emb
+            k = k + mem_pos_emb
         q = q.transpose(1, 2)  # (batch, time1, head, d_k)
 
         n_batch_pos = pos_emb.size(0)
@@ -193,7 +203,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
         # (batch, head, time1, d_k)
-        q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
+        q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)   
         # (batch, head, time1, d_k)
         q_with_bias_v = (q + self.pos_bias_v).transpose(1, 2)
 
