@@ -284,6 +284,10 @@ class ConformerEncoder(NeuralModule, Exportable):
         for lth, layer in enumerate(self.layers):
             audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
 
+        #import numpy as np
+        #np.save('audio_signal.npy', audio_signal.detach().cpu().numpy())
+        #exit()
+
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
      

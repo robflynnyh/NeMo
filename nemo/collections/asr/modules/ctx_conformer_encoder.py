@@ -37,6 +37,7 @@ from einops import rearrange
 
 from torch.nn import functional as F
 
+import numpy as np
 
 __all__ = ['CtxConformerEncoder']
 
@@ -342,6 +343,17 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             self.register_buffer('seq_range', seq_range, persistent=False)
         self.pos_enc.extend_pe(max_audio_length, device)
 
+    def log_mem_vectors(self, audio_seq):
+        mem_vecs = audio_seq[:, :self.num_memory_vectors, :]
+        np.save('mem_vecs.npy', mem_vecs.detach().cpu().numpy())
+        exit()
+
+    def log_last_vector(self, audio_seq):
+        notmems = audio_seq[:, self.num_memory_vectors:, :]
+        np.save('notmems.npy', notmems.detach().cpu().numpy())
+        exit()
+
+
     @staticmethod
     def create_custom_forward(module): # for activation checkpointing 
         def custom_forward(*args, **kwargs):
@@ -392,11 +404,13 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             memseq_pos = torch.cat((mem_pos, seq_pos), dim=0)
             memseq_pos = memseq_pos.unsqueeze(0).repeat(batch_size, 1, 1)
             memseq_pos.to(device)
-            print(memseq_pos.shape, pad_mask.shape)
+
             memseq_pos.masked_fill_(pad_mask.unsqueeze(-1), 0)
             return memseq_pos
         else:
             return None
+
+
 
     @typecheck()
     def forward(self, audio_signal, decoder, length=None, segment_lens=None):
@@ -449,8 +463,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             pad_mask = ~pad_mask
         else:
             pad_mask = None
-
-        mems_in_conv = None if self.include_mems_in_conv == False else self.num_memory_vectors # whether to include the memory vectors in the conformal convolution modules
+ 
+        mems_in_conv = None if self.include_mems_in_conv == True else self.num_memory_vectors # whether to include the memory vectors in the conformal convolution modules
         mem_seq_pos = self.get_mem_pos_embs(max_audio_length, audio_signal.size(0), pad_mask, audio_signal.device)
 
         for lth, layer in enumerate(self.layers):
@@ -458,7 +472,10 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 audio_signal = checkpoint(self.create_custom_forward(layer), audio_signal, att_mask, pos_emb, pad_mask, mems_in_conv, mem_seq_pos)
             else:
                 audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask, num_memory_vectors=mems_in_conv, mem_pos_emb=mem_seq_pos)
-        
+     
+        #self.log_last_vector(audio_signal)
+          
+
         interim_posteriors = []
 
         audio_signal, interim_log_posterior = self.selfconditioning(audio_signal, decoder)
@@ -468,27 +485,33 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         mem_indexes = []
         mem_pad_masks = []
         max_segment_length = max(segment_lens) * self.num_memory_vectors
-        culmulative_segment_lens = [sum(segment_lens[:i])*self.num_memory_vectors for i in range(len(segment_lens))]
+        culmulative_segment_lens = [sum(segment_lens[:i+1])*self.num_memory_vectors for i in range(len(segment_lens))]
 
         for i, segment_length in enumerate(segment_lens):
             from_index = 0 if i == 0 else culmulative_segment_lens[i-1]
             to_index = culmulative_segment_lens[i]
+
             cur_indexes = torch.arange(from_index, to_index, dtype=torch.long)
+
             topad = max_segment_length - cur_indexes.shape[0]
+       
             cur_indexes = torch.cat([cur_indexes, torch.LongTensor([-1]*topad)]) # -1 as concatenated padding as the last index
             mem_pad_mask = torch.LongTensor([1]*(to_index-from_index) + [0]*topad)
-            
+       
             mem_indexes.append(cur_indexes.unsqueeze(0).repeat(segment_length, 1))
             mem_pad_masks.append(mem_pad_mask.unsqueeze(0).repeat(segment_length, 1))
+      
 
         mem_padding_masks = torch.cat(mem_pad_masks, dim=0).bool().to(audio_signal.device)
         mem_indexes = torch.cat(mem_indexes, dim=0).to(audio_signal.device)
+
 
         self.cross_attn_pos_enc.init_batch_pos_embs(segment_lens, audio_signal.device, mem_mask=mem_padding_masks.unsqueeze(-1))
 
         pad_vector = self.pad_vector.to(audio_signal.device)
     
         for repeat in range(self.num_repeats): 
+
             # memory vectors are just learnt embeddings that are prepended to the input prior to the first layer
             memory_vectors = audio_signal[:, :self.num_memory_vectors, :]
             # rearrane via grouping batch and sequence dimensions
@@ -524,6 +547,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 audio_signal = self.repeated_conformer_layer2(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask, num_memory_vectors=mems_in_conv, mem_pos_emb=mem_seq_pos)
         
         #########################
+        
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal) # if dim of decoder is not equal to dim of encoder, then we need to project the output
