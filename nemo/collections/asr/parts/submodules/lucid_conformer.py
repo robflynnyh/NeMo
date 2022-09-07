@@ -1,12 +1,14 @@
 '''
 Heavily relies on code from: https://github.com/lucidrains/conformer
 '''
-
+from math import pi, log
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
+import numpy as np
+import os
 
-from einops import rearrange
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from nemo.collections.asr.parts.submodules.x_transformers_local import CrossAttender, Attention as xAttention
 from inspect import isfunction
@@ -141,6 +143,108 @@ class LocalAttentionMasking(nn.Module):
         mask = mask.to(x.device)
         return x.masked_fill(~mask, mask_val)
 
+def save_tensor(x, path='./attns'):
+    indir = os.listdir(path)
+    snum = 0
+    if len(indir) > 0:
+        snum = max([int(x.split('.')[0]) for x in indir]) + 1
+    np.save(os.path.join(path, f'{snum}.npy'), x.detach().cpu().numpy())
+
+
+
+class MappingAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        heads = 8,
+        dim_head = 64,
+        dropout = 0.,
+        sparse_topk = None,
+        num_bands = 32,
+        max_freq = 60
+    ):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.heads= heads
+        self.scale = dim_head ** -0.5
+
+        self.num_bands = num_bands
+        self.max_freq = max_freq
+
+        dim_w_pos = dim + num_bands * 2 + 1
+        self.to_q = nn.Linear(dim_w_pos, inner_dim, bias = True)
+        self.to_k = nn.Linear(dim_w_pos, inner_dim, bias = True)
+        self.to_v = nn.Linear(dim, inner_dim, bias = True)
+        self.to_out = nn.Linear(inner_dim, dim)
+
+        self.sparse_topk = sparse_topk
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def fourier_encode(x, max_freq=60, num_bands = 32):
+        x = x.unsqueeze(-1)
+        device, dtype, orig_x = x.device, x.dtype, x
+
+        scales = torch.linspace(1., max_freq / 2, num_bands, device = device, dtype = dtype)
+        scales = scales[(*((None,) * (len(x.shape) - 1)), Ellipsis)]
+
+        x = x * scales * pi
+        x = torch.cat([x.sin(), x.cos()], dim = -1)
+        x = torch.cat((x, orig_x), dim = -1)
+        return x
+
+
+    def forward(self, x, context = None, mask = None, context_mask = None):
+        n, device, h, has_context = x.shape[-2], x.device, self.heads, exists(context)
+        context = default(context, x)
+
+        qb, qn, qd, qdtype = *x.shape, x.dtype
+        kb, kn, kd, kdtype = *context.shape, context.dtype
+        
+        axis_pos_q = rearrange(torch.linspace(-1., 1., steps=qn, device=device, dtype=qdtype), 'n -> n ()')
+        axis_pos_k = rearrange(torch.linspace(-1., 1., steps=kn, device=device, dtype=kdtype), 'n -> n ()')
+        
+        enc_pos_q = repeat(rearrange(self.fourier_encode(axis_pos_q, max_freq=self.max_freq, num_bands=self.num_bands), 'n () d -> n d'), '... -> b ...', b = qb)
+        enc_pos_k = repeat(rearrange(self.fourier_encode(axis_pos_k, max_freq=self.max_freq, num_bands=self.num_bands), 'n () d -> n d'), '... -> b ...', b = kb)
+
+        for_q = torch.cat((x, enc_pos_q), dim=-1)
+        for_k = torch.cat((context, enc_pos_k), dim=-1)
+        for_v = context
+
+
+
+        q, k, v = self.to_q(for_q), self.to_k(for_k), self.to_v(for_v) 
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v)) 
+
+    
+        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+
+        if any(map(exists, (mask, context_mask))):
+            q_mask = default(mask, lambda: torch.ones(*x.shape[:2], device = device).bool())
+            k_mask = q_mask if not exists(context) else context_mask
+            k_mask = default(k_mask, lambda: torch.ones(*context.shape[:2], device = device).bool())
+            q_mask = rearrange(q_mask, 'b i -> b 1 i 1')
+            k_mask = rearrange(k_mask, 'b j -> b 1 1 j')
+            input_mask = q_mask * k_mask
+            dots.masked_fill_(~input_mask, -torch.finfo(dots.dtype).max)
+
+        if exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1]:
+            top, _ = dots.topk(self.sparse_topk, dim = -1)
+            vk = top[..., -1].unsqueeze(-1).expand_as(dots)
+            mask = dots < vk
+            dots.masked_fill_(mask, -torch.finfo(dots.dtype).max)
+            del mask
+
+        attn = dots.softmax(dim = -1)
+
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+        return self.dropout(out)
+
+
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -211,6 +315,9 @@ class Attention(nn.Module):
             dots = self.local_attn_mask(dots)
 
         attn = dots.softmax(dim = -1)
+
+        #save_tensor(attn, path='./attns')
+
 
         attn = attn * gating_mask if exists(gating_mask) else attn
 

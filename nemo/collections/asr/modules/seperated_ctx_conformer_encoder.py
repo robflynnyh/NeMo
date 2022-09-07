@@ -32,7 +32,7 @@ from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, NeuralType, SpectrogramType, LogprobsType
 
 from torch.utils.checkpoint import checkpoint # gradient/activation checkpointing
-from nemo.collections.asr.parts.submodules.lucid_conformer import CrossAttnHistoryPositionalEncoding, CtxCrossConformerBlock, Attention
+from nemo.collections.asr.parts.submodules.lucid_conformer import CrossAttnHistoryPositionalEncoding, CtxCrossConformerBlock, MappingAttention
 
 from einops import rearrange
 
@@ -161,17 +161,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         if local_attn:
             print('Using local attention for cross-attention')
 
-        self.residual_context_gating = residual_context_gating
-        if self.residual_context_gating == 'learned_scaler' or self.residual_context_gating == 'learned_sigmoid_scaler':
-            self.residual_context_gating_scaler = nn.Parameter(torch.tensor(1.0))
-        elif self.residual_context_gating == 'sigmoid_gating':
-            self.residual_context_gating_w1 = nn.Linear(d_model, d_model, bias=False)
-            self.residual_context_gating_w2 = nn.Linear(d_model, d_model, bias=False)
-            self.residual_context_gating_b = nn.Parameter(torch.zeros(d_model))
-        elif self.residual_context_gating == 'adaptive_scaler_mean' or self.residual_context_gating == 'adaptive_scaler_sum':
-            self.residual_context_gating_scaler_projection = nn.Linear(d_model, 1)
-        else:
-            assert self.residual_context_gating is None, f"Unknown residual context gating type {self.residual_context_gating}"
+
 
 
 
@@ -272,7 +262,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 weight_standardization=weight_standardization
         )
 
-        self.map_spectogram_to_memory = Attention(
+        self.map_spectogram_to_memory = MappingAttention(
             dim = d_model,
             heads = n_heads,
             dim_head = d_model // n_heads,
@@ -280,7 +270,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             sparse_topk = sparse_topk,
         )
 
-        self.map_memory_to_spectogram = Attention(
+        self.map_memory_to_spectogram = MappingAttention(
             dim = d_model,
             heads = n_heads,
             dim_head = d_model // n_heads,
@@ -294,6 +284,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             num_context_vectors=num_memory_vectors
         )
      
+
         self.cross_conformer_layer = CtxCrossConformerBlock( # cross attention applied between local and global context
             dim = d_model,
             dim_head = d_model // n_heads,
@@ -388,26 +379,6 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         
         return audio_signal, interim_log_posterior
 
-    def integration_gating(self, context, audio):
-        '''
-        Gates the residual for mapping the context to the audio
-        '''
-        if self.residual_context_gating == None:
-            return context + audio # no gating
-        elif self.residual_context_gating == 'learned_scaler':
-            return context + audio * self.residual_context_gating_scaler
-        elif self.residual_context_gating == 'learned_sigmoid_scaler':
-            gating_fn = self.residual_context_gating_scaler.sigmoid()
-            return context * gating_fn + audio * (1 - gating_fn)
-        elif self.residual_context_gating == 'sigmoid_gating':
-            gating_fn = (self.residual_context_gating_w1(context) + self.residual_context_gating_w2(audio) + self.residual_context_gating_b).sigmoid()
-            return context * gating_fn + audio * (1 - gating_fn)
-        elif self.residual_context_gating == 'adaptive_scaler_mean' or self.residual_context_gating == 'adaptive_scaler_sum':
-            gating_fn = self.residual_context_gating_scaler_projection(audio)
-            gating_fn = gating_fn.mean(dim=1) if self.residual_context_gating == 'adaptive_scaler_mean' else gating_fn.sum(dim=1) # sum or mean across the sequence
-            return context * gating_fn.sigmoid() + audio
-        else:
-            raise Exception('Invalid residual context gating type')
 
     @typecheck()
     def forward(self, audio_signal, decoder, length=None, segment_lens=None):
@@ -479,7 +450,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         mem_indexes = []
         mem_pad_masks = []
         max_segment_length = max(segment_lens) * self.num_memory_vectors
-        culmulative_segment_lens = [sum(segment_lens[:i])*self.num_memory_vectors for i in range(len(segment_lens))]
+        culmulative_segment_lens = [sum(segment_lens[:i+1])*self.num_memory_vectors for i in range(len(segment_lens))]
 
         for i, segment_length in enumerate(segment_lens):
             from_index = 0 if i == 0 else culmulative_segment_lens[i-1]
@@ -527,13 +498,13 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             )
 
             # map the memory vectors back to the audio signal
-            audio_signal = self.integration_gating(checkpoint(
+            audio_signal = checkpoint(
                 self.create_custom_forward(self.map_memory_to_spectogram),
                     audio_signal, # query vectors
                     memory_vectors, # key/value vectors
                     ~pad_mask, # query mask
                     None # key/value mask
-            ), audio_signal) # orinal signal included through residual/gating connection
+            ) + audio_signal # add the audio signal as a residual connection
 
             # now for self attention over the audio_signal
     

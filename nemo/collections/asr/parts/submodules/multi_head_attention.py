@@ -116,6 +116,7 @@ class MultiHeadAttention(nn.Module):
         else:
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
 
+        #print('self std', attn[0][0][0].std())
 
         p_attn = self.dropout(attn)
         x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)

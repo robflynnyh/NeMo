@@ -259,7 +259,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 dropout_att=dropout_att,
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
-                sparse_topk = sparse_topk,
+                sparse_topk = None,
                 weight_standardization=weight_standardization
         )
 
@@ -274,7 +274,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 dropout_att=dropout_att,
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
-                sparse_topk = sparse_topk,
+                sparse_topk = None,
                 weight_standardization=weight_standardization
         )
      
@@ -514,6 +514,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
 
             # memory vectors are just learnt embeddings that are prepended to the input prior to the first layer
             memory_vectors = audio_signal[:, :self.num_memory_vectors, :]
+
+
             # rearrane via grouping batch and sequence dimensions
             memory_sequences = rearrange(memory_vectors, 'b n d -> (b n) d')
             # cat padding token to use during indexing
