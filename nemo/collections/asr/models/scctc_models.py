@@ -493,7 +493,8 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "segment_lens": NeuralType(tuple('S'), LengthsType(), optional=True),
-            "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True)
+            "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "return_cross_utterance_attention": NeuralType(tuple(), BoolType(), optional=True),
         }
 
     @property
@@ -503,12 +504,18 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             "interim_posteriors": NeuralType(('H', 'B', 'T', 'D'), LogprobsType()),
             "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
             "greedy_predictions": NeuralType(('B', 'T'), LabelsType()),
-            "magnitude_loss": NeuralType(None, LossType()),
+            "other_outputs": NeuralType(None, optional=True),
         }
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None, segment_lens=None
+        self, 
+        input_signal=None, 
+        input_signal_length=None, 
+        processed_signal=None, 
+        processed_signal_length=None, 
+        segment_lens=None, 
+        return_cross_utterance_attention=None
     ):
         """
         Forward pass of the model.
@@ -546,23 +553,28 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        magnitude_loss = None # old
         
         encoder_args = {
             'audio_signal': processed_signal, 
             'decoder':self.decoder, 
             'length':processed_signal_length,
-            'segment_lens':segment_lens
+            'segment_lens':segment_lens,
+            'return_cross_utterance_attention':return_cross_utterance_attention
         }
+        
         encoder_args = {k: v for k, v in encoder_args.items() if v is not None}
 
-        encoded, iterim_posteriors, encoded_len = self.encoder(**encoder_args)
+        encoder_out = self.encoder(**encoder_args)
+        encoded, iterim_posteriors, encoded_len = encoder_out[:3]
+
+        additional_outputs = None if len(encoder_out) == 3 else encoder_out[3]
+
         log_probs = self.decoder(encoder_output=encoded, logits=False)
 
 
         
         greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
-        return log_probs, iterim_posteriors, encoded_len, greedy_predictions, magnitude_loss
+        return log_probs, iterim_posteriors, encoded_len, greedy_predictions, additional_outputs
        
 
 

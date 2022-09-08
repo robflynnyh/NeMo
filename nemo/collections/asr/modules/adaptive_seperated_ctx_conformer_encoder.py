@@ -33,7 +33,7 @@ from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, N
 from nemo.core.neural_types.elements import BoolType
 
 from torch.utils.checkpoint import checkpoint # gradient/activation checkpointing
-from nemo.collections.asr.parts.submodules.lucid_conformer import CrossAttnHistoryPositionalEncoding, CtxCrossConformerBlock, MappingAttention
+from nemo.collections.asr.parts.submodules.lucid_conformer import AdaptiveCrossAttnHistoryPositionalEncoding, CtxCrossConformerBlock, MappingAttention
 
 from einops import rearrange
 
@@ -276,7 +276,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             sparse_topk = sparse_topk,
         )
      
-        self.cross_attn_pos_enc = CrossAttnHistoryPositionalEncoding( 
+        self.cross_attn_pos_enc = AdaptiveCrossAttnHistoryPositionalEncoding( 
             pos_dim=d_model,
             max_seq_len=max_seq_len,
             num_context_vectors=num_memory_vectors
@@ -305,7 +305,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         self.memory_dropout = nn.Dropout(memory_dropout)
         self.cross_attn_dropout = cross_attn_dropout
 
-        self.num_memory_vectors = num_memory_vectors
+        self.num_memory_vectors = num_memory_vectors # maximum number of memory vectors to learn
+
         self.memory_vectors = nn.Parameter(torch.Tensor(num_memory_vectors, d_model))
         nn.init.uniform_(self.memory_vectors, -0.1, 0.1)
 
@@ -419,6 +420,24 @@ class CtxConformerEncoder(NeuralModule, Exportable):
 
         memory_vectors = self.memory_vectors.unsqueeze(0).repeat([audio_signal.size(0), 1, 1])
 
+        mem_sizes = length.div(10, rounding_mode='floor').long() # memory size is 10% of the length of the utterance
+        mem_sizes[mem_sizes < 1] = 1 # minimum memory size is 1
+        mem_sizes[mem_sizes > self.memory_vectors.size(0)] = self.memory_vectors.size(0) # maximum memory size is the size of the memory vectors
+
+        # trim memory vectors to the maximum memory size
+        memory_vectors = memory_vectors[:, :mem_sizes.max(), :]
+
+        vertical_mem_padding_mask = []
+        full_mask = torch.ones(mem_sizes.max()).bool().to(memory_vectors.device)
+        for mem_size in mem_sizes:
+            init_mem_mask = full_mask.clone()
+            init_mem_mask[:mem_size] = 0
+            vertical_mem_padding_mask.append(init_mem_mask)
+        vertical_mem_padding_mask = torch.stack(vertical_mem_padding_mask)
+
+        memory_vectors.masked_fill_(vertical_mem_padding_mask.unsqueeze(-1), 0) # mask out the memory vectors that are not used to save computation
+        
+
         audio_signal, pos_emb = self.pos_enc(audio_signal)
 
         # Create the self-attention and padding masks
@@ -450,27 +469,44 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         audio_signal, interim_log_posterior = self.selfconditioning(audio_signal, decoder)
         interim_posteriors.append(interim_log_posterior)
 
-        # create indexes and padding masks for cross-utterance attention
-        mem_indexes = []
-        mem_pad_masks = []
-        max_segment_length = max(segment_lens) * self.num_memory_vectors
-        culmulative_segment_lens = [sum(segment_lens[:i+1])*self.num_memory_vectors for i in range(len(segment_lens))]
+
+        # get mem lentgth stuff for creating indexes
+        segment_mem_sequence_lengths = []
+        culm_segment_lengths = segment_lens.cumsum(dim=0)
 
         for i, segment_length in enumerate(segment_lens):
-            from_index = 0 if i == 0 else culmulative_segment_lens[i-1]
-            to_index = culmulative_segment_lens[i]
+            from_index = 0 if i == 0 else culm_segment_lengths[i-1]
+            to_index = culm_segment_lengths[i]
+            segment_mem_sequence_lengths.append(mem_sizes[from_index:to_index].sum())
+        segment_mem_sequence_lengths = torch.as_tensor(segment_mem_sequence_lengths)
+
+        max_segment_length = max(segment_mem_sequence_lengths)
+
+        culm_segment_mem_lengths = segment_mem_sequence_lengths.cumsum(dim=0)
+
+        # create indexes and padding masks for cross-utterance attention
+
+        indexes = []
+        mem_padding_masks = []
+        for i, segment_length in enumerate(segment_lens):
+            from_index = 0 if i == 0 else culm_segment_mem_lengths[i-1]
+            to_index = culm_segment_mem_lengths[i]
             cur_indexes = torch.arange(from_index, to_index, dtype=torch.long)
             topad = max_segment_length - cur_indexes.shape[0]
-            cur_indexes = torch.cat([cur_indexes, torch.LongTensor([-1]*topad)]) # -1 as concatenated padding as the last index
-            mem_pad_mask = torch.LongTensor([1]*(to_index-from_index) + [0]*topad)
-            
-            mem_indexes.append(cur_indexes.unsqueeze(0).repeat(segment_length, 1))
-            mem_pad_masks.append(mem_pad_mask.unsqueeze(0).repeat(segment_length, 1))
+            cur_indexes = torch.cat([cur_indexes, torch.LongTensor([-1]*topad)])
+            padding_mask = torch.LongTensor([1]*(to_index-from_index) + [0]*topad)
 
-        mem_padding_masks = torch.cat(mem_pad_masks, dim=0).bool().to(audio_signal.device)
-        mem_indexes = torch.cat(mem_indexes, dim=0).to(audio_signal.device)
+            indexes.append(cur_indexes.unsqueeze(0).repeat(segment_length, 1))
+            mem_padding_masks.append(padding_mask.unsqueeze(0).repeat(segment_length, 1))
 
-        self.cross_attn_pos_enc.init_batch_pos_embs(segment_lens, audio_signal.device, mem_mask=mem_padding_masks.unsqueeze(-1))
+
+        mem_padding_masks = torch.cat(mem_padding_masks, dim=0).bool().to(audio_signal.device)
+        mem_indexes = torch.cat(indexes, dim=0).to(audio_signal.device)
+
+      
+        non_padding_mems_indexes = torch.cat([torch.arange(i*max(mem_sizes), i*max(mem_sizes)+mem_num, dtype=torch.long) for i, mem_num in enumerate(mem_sizes)])
+
+        self.cross_attn_pos_enc.init_batch_pos_embs(segment_lens, mem_sizes, audio_signal.device, mem_mask=mem_padding_masks.unsqueeze(-1))
 
         pad_vector = self.pad_vector.to(audio_signal.device)
     
@@ -480,12 +516,12 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 self.create_custom_forward(self.map_spectogram_to_memory),
                 memory_vectors, # query vectors
                 audio_signal, # key/value vectors
-                None, # query mask
+                vertical_mem_padding_mask, # padding mask for the memory vectors
                 ~pad_mask # key/value mask
             ) + memory_vectors # add the memory vectors as a residual connection
 
-            # rearrane via grouping batch and sequence dimensions
-            memory_sequences = rearrange(memory_vectors, 'b n d -> (b n) d')
+            # rearrane via grouping batch and sequence dimensions and remove the padding
+            memory_sequences = rearrange(memory_vectors, 'b n d -> (b n) d')[non_padding_mems_indexes]
             # cat padding token to use during indexing
             memory_sequences = torch.cat([memory_sequences, pad_vector], dim=0)
             # use indexing to get the correct sequence of memory vectors for each segment of utterances
@@ -499,7 +535,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 self.create_custom_forward(self.cross_conformer_layer), 
                 memory_vectors, # x
                 memory_sequences, # context
-                None, # x mask
+                vertical_mem_padding_mask, # x mask
                 mem_padding_masks, # context mask
                 get_attn_map # whether to return the cross-utterance attention
             )
@@ -511,7 +547,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                     audio_signal, # query vectors
                     memory_vectors, # key/value vectors
                     ~pad_mask, # query mask
-                    None # key/value mask
+                    vertical_mem_padding_mask
             ) + audio_signal # add the audio signal as a residual connection
 
             # now for self attention over the audio_signal

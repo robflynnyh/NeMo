@@ -145,6 +145,7 @@ class LocalAttentionMasking(nn.Module):
 
 def save_tensor(x, path='./attns'):
     indir = os.listdir(path)
+    indir = [el for el in indir if el.endswith('.npy')]
     snum = 0
     if len(indir) > 0:
         snum = max([int(x.split('.')[0]) for x in indir]) + 1
@@ -277,7 +278,15 @@ class Attention(nn.Module):
             self.local_attn_mask = LocalAttentionMasking(local_attn_pattern)
 
 
-    def forward(self, x, context = None, mask = None, context_mask = None, gating_mask=None):
+    def forward(
+            self, 
+            x, 
+            context = None, 
+            mask = None, 
+            context_mask = None, 
+            gating_mask=None,
+            return_attn = False
+        ):
         n, device, h, max_pos_emb, has_context = x.shape[-2], x.device, self.heads, self.max_pos_emb, exists(context)
         context = default(context, x) 
       
@@ -318,13 +327,13 @@ class Attention(nn.Module):
 
         #save_tensor(attn, path='./attns')
 
-
         attn = attn * gating_mask if exists(gating_mask) else attn
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
         out = self.to_out(out)
-        return self.dropout(out)
+
+        return (self.dropout(out), attn) if return_attn else self.dropout(out)
 
 
 class GatingAttention(nn.Module):
@@ -646,7 +655,7 @@ class CtxCrossConformerBlock(nn.Module):
         self.post_norm = nn.LayerNorm(dim)
 
 
-    def forward(self, x, context, mask = None, context_mask = None):
+    def forward(self, x, context, mask = None, context_mask = None, return_attn = False):
         x = self.ff1(x) + x
         context = self.ff1KV(context) + context
 
@@ -654,11 +663,14 @@ class CtxCrossConformerBlock(nn.Module):
             x = self.conv(x, pad_mask=mask) + x
             context = self.convKV(context, pad_mask=context_mask) + context
 
-        x = self.attn(x, context=context, mask = mask, context_mask = context_mask) + x
-        
+        out_attn = self.attn(x, context=context, mask = mask, context_mask = context_mask, return_attn = return_attn) 
+        out_attn, attn = out_attn if return_attn else (out_attn, None)
+        x = out_attn + x
+
         x = self.ff2(x) + x
         x = self.post_norm(x)
-        return x
+    
+        return x if not return_attn else (x, attn)
 
 # Conformer Block
 
@@ -877,6 +889,90 @@ class CCATIntegrationConformerBlock(nn.Module):
         
         return x
     
+
+class AdaptiveCrossAttnHistoryPositionalEncoding(nn.Module):
+    '''
+    Works for memory vector lengths that are dependent on the input sequence length.
+    (CrossAttnHistoryPositionalEncoding only works for fixed memory vector lengths)
+    '''
+    def __init__(
+        self,
+        pos_dim = 176,
+        max_seq_len = 24,
+        num_context_vectors = 10
+    ):
+        super().__init__()
+        self.pos_dim = pos_dim
+        self.max_seq_len = max_seq_len
+        self.num_context_vectors = num_context_vectors
+
+        if self.max_seq_len % 2 != 0: 
+            self.max_seq_len += 1 # make it even
+
+        self.halfpoint = self.max_seq_len // 2
+
+        self.embedding = nn.Embedding(max_seq_len, pos_dim) 
+        self.embedding.weight.data.uniform_(-0.1, 0.1)
+        
+        self.pos_embs = None
+
+    def clear(self):
+        self.pos_embs = None
+    
+    def create_sequence_pos_matrix(self, sub_batch_size, max_sub_batch_size, mem_sizes, max_mem_seq_len):
+        max_mem_seq_len, mem_sizes = max_mem_seq_len.cpu(), mem_sizes.cpu() # keep on cpu for now
+
+        interleave_nums = torch.ones(max_sub_batch_size, dtype=torch.long)
+        interleave_nums[:mem_sizes.size(0)] = mem_sizes
+ 
+        interleave_padding_amount = max_mem_seq_len - interleave_nums.sum()       
+        interleave_nums[-1] += max(interleave_padding_amount, 0) # add a bunch of repeats to the last item so all the sequences are the same length (this is masked out later)
+
+        halfpoint = self.halfpoint
+        pos_matrix = torch.arange(0, max_sub_batch_size).unsqueeze(0).repeat(sub_batch_size, 1) - torch.arange(0, sub_batch_size).unsqueeze(1) + halfpoint
+        pos_matrix = pos_matrix.clamp(min=0, max=self.max_seq_len - 1).repeat_interleave(interleave_nums, dim=1).long()
+
+        if interleave_padding_amount < 0:
+            pos_matrix = pos_matrix[:, :max_mem_seq_len]
+
+        return pos_matrix
+
+    @staticmethod
+    def mem_size_list_for_segment(sub_batch_sizes, mem_sizes):
+        '''Gets a list of the memory sizes for a segment'''
+        culm_SB_lengths = sub_batch_sizes.cumsum(dim=0)
+        mem_size_list = []
+        for i, seg_len in enumerate(sub_batch_sizes):
+            from_index = 0 if i == 0 else culm_SB_lengths[i-1]
+            to_index = culm_SB_lengths[i]
+            mem_size_list.append(mem_sizes[from_index:to_index])
+
+
+        return mem_size_list
+
+    def init_batch_pos_embs(self, sub_batch_sizes, mem_sizes, device, mem_mask=None):
+        mem_size_list = self.mem_size_list_for_segment(sub_batch_sizes, mem_sizes)
+        max_mem_seq_len = max([el.sum() for el in mem_size_list])
+
+        pos_matrices = [self.create_sequence_pos_matrix(sub_batch_size, max(sub_batch_sizes), mem_size_list[i], max_mem_seq_len) for i, sub_batch_size in enumerate(sub_batch_sizes)]
+        pos_matrices = torch.cat(pos_matrices, dim=0).to(device)
+        mem_mask = mem_mask.to(device) if mem_mask is not None else None
+    
+        pos_embs = self.embedding(pos_matrices)
+        
+        if mem_mask is not None:
+            assert mem_mask.shape[0] == pos_embs.shape[0] and mem_mask.shape[1] == pos_embs.shape[1], 'mem_mask and pos_embs have different shapes'
+            if len(mem_mask.shape) == 2:
+                mem_mask = mem_mask.unsqueeze(-1)
+            assert len(mem_mask.shape) == 3, 'mem_mask has wrong shape'
+            pos_embs.masked_fill_(~mem_mask, 0)
+        self.pos_embs = pos_embs
+
+    def forward(self, x):
+        assert self.pos_embs is not None, 'pos_embs is not initialized'
+        return x + self.pos_embs
+
+
 
 class CrossAttnHistoryPositionalEncoding(nn.Module):
     def __init__(
