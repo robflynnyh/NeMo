@@ -126,6 +126,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         residual = residual + self.dropout(x) * self.fc_factor
 
         x = self.norm_self_att(residual)
+        #print(x.shape, pos_emb.shape, 'attn stuff')
         if self.self_attention_model == 'rel_pos':
             x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb)
         elif self.self_attention_model == 'abs_pos':

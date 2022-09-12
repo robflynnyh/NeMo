@@ -432,9 +432,13 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             
             ds_sb_attn_mask = pad_mask_to_attn_mask(ds_sb_masks)
             
+            # update max_lens
+            max_ds_audio_length = ds_sb_audio.size(1)
+            if max_ds_audio_length > self.max_audio_length:
+                self.set_max_audio_length(max_ds_audio_length)
+
             if ds_pos_emb == None:
                 ds_sb_audio, ds_pos_emb = self.pos_enc(ds_sb_audio)
-            
          
             ds_sb_audio = checkpoint(
                 self.create_custom_forward(self.ds_sequence_conformer_layer),
