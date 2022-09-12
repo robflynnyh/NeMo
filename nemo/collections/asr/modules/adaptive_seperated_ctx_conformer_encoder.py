@@ -397,7 +397,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         max_audio_length: int = audio_signal.size(-1)
 
         if segment_lens == None:
-            segment_lens = [audio_signal.shape[0]] # assume segment is the entire batch if not specified
+            segment_lens = torch.LongTensor([audio_signal.shape[0]])
 
         if max_audio_length > self.max_audio_length:
             self.set_max_audio_length(max_audio_length)
@@ -572,7 +572,10 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         interim_posteriors = torch.stack(interim_posteriors, dim=0)
      
         main_outputs = (out_signal, interim_posteriors, length)
-        additional_outputs = {'attn_map': attn_map}
+        additional_outputs = {
+            'attn_map': attn_map,
+            'mem_sizes': mem_sizes,
+        }
         return main_outputs if attn_map is None else main_outputs + (additional_outputs,)
 
 

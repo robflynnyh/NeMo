@@ -43,6 +43,10 @@ from torch.nn import functional as F
 __all__ = ['CtxConformerEncoder']
 
 
+def pad_mask_to_attn_mask(pad_mask):
+    """Converts padding mask to attention mask."""
+    return rearrange(pad_mask, 'b i -> b i ()') * rearrange(pad_mask, 'b j -> b () j')
+
 class CtxConformerEncoder(NeuralModule, Exportable):
     """
     The encoder for ASR model of Conformer.
@@ -260,54 +264,37 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 weight_standardization=weight_standardization
         )
 
-        self.map_spectogram_to_memory = MappingAttention(
-            dim = d_model,
-            heads = n_heads,
-            dim_head = d_model // n_heads,
-            dropout = dropout_att,
+        self.ds_sequence_conformer_layer = ConformerLayer( # full seq layer
+            d_model=d_model,
+            d_ff=d_ff,
+            self_attention_model=self_attention_model,
+            n_heads=n_heads,
+            conv_kernel_size=conv_kernel_size,
+            conv_norm_type=conv_norm_type,
+            dropout=dropout,
+            dropout_att=dropout_att,
+            pos_bias_u=pos_bias_u,
+            pos_bias_v=pos_bias_v,
             sparse_topk = sparse_topk,
+            weight_standardization=weight_standardization
         )
 
-        self.map_memory_to_spectogram = MappingAttention(
-            dim = d_model,
-            heads = n_heads,
-            dim_head = d_model // n_heads,
-            dropout = dropout_att,
-            sparse_topk = sparse_topk,
+        self.ds_layer = downsample_layer(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=5,
+            stride=5,
+            padding=0,
+            expansion_factor=2
         )
-     
-        self.cross_attn_pos_enc = CrossAttnHistoryPositionalEncoding( 
-            pos_dim=d_model,
-            max_seq_len=max_seq_len,
-            num_context_vectors=num_memory_vectors
-        )
-     
+        self.upsample_layer = upsample_fn
 
-        self.cross_conformer_layer = CtxCrossConformerBlock( # cross attention applied between local and global context
-            dim = d_model,
-            dim_head = d_model // n_heads,
-            heads = n_heads,
-            ff_mult = ff_expansion_factor,
-            conv_kernel_size = num_memory_vectors // 3,
-            convKV_kernel_size = num_memory_vectors,
-            attn_dropout = cross_post_attn_dropout,
-            ff_dropout = dropout,
-            sparse_topk = sparse_topk,
-            conv_norm_type = conv_norm_type,
-            local_attn = local_attn,
-            use_conv = True
-        )
 
         self.self_condition = self_condition
 
         self.num_repeats = num_repeats
 
-        self.memory_dropout = nn.Dropout(memory_dropout)
-        self.cross_attn_dropout = cross_attn_dropout
-
-        self.num_memory_vectors = num_memory_vectors
-        self.memory_vectors = nn.Parameter(torch.Tensor(num_memory_vectors, d_model))
-        nn.init.uniform_(self.memory_vectors, -0.1, 0.1)
+  
 
         if feat_out > 0 and feat_out != self._feat_out:
             self.out_proj = nn.Linear(self._feat_out, feat_out)
@@ -342,30 +329,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         return custom_forward
 
 
-    def apply_cross_attend_dropout(self, x):
-        '''
-        cross-attend dropout used here: https://arxiv.org/pdf/2202.07765.pdf
-        this is basically a random selection of elements in the input tensor
-        i.e if the input tensor is (B, N, D) and the cross attend dropout is
-        0.25 then output will be (B, N*0.75, D)
-        Wasn't sure how to implement this efficiently so used lucidrains implementation from the perceiver AR 
-        https://github.com/lucidrains/perceiver-ar-pytorch/blob/main/perceiver_ar_pytorch/perceiver_ar_pytorch.py
-        # need to change this slightly so padding is excluded from the calculation
-        '''
-        cross_attn_dropout = self.cross_attn_dropout
-        # check if model is training or not
-        if cross_attn_dropout > 0 and self.training:
-            raise NotImplementedError # not workin now because padding also needs to be dropped
-
-            batch_size, num_frames, dim = x.size()
-            rand = torch.zeros((batch_size, num_frames), device=x.device).uniform_()
-            num_frames_to_keep = int(num_frames * (1 - cross_attn_dropout))
-            keep_indices = rand.topk(num_frames_to_keep, dim=-1).indices
-            keep_mask = torch.zeros_like(rand).scatter_(1, keep_indices, 1).bool()
-            # dang thats clean
-            return rearrange(x[keep_mask], '(b n) d -> b n d', b=batch_size)
-        else:
-            return x
+  
             
     def selfconditioning(self, audio_signal, decoder):
         interim_logits = decoder(encoder_output=audio_signal.transpose(1, 2), logits=True)
@@ -417,8 +381,6 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         max_audio_length = audio_signal.size(1)
 
 
-        memory_vectors = self.memory_vectors.unsqueeze(0).repeat([audio_signal.size(0), 1, 1])
-
         audio_signal, pos_emb = self.pos_enc(audio_signal)
 
         # Create the self-attention and padding masks
@@ -444,77 +406,52 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 audio_signal = layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
         
 
-
         interim_posteriors = []
 
         audio_signal, interim_log_posterior = self.selfconditioning(audio_signal, decoder)
         interim_posteriors.append(interim_log_posterior)
 
-        # create indexes and padding masks for cross-utterance attention
-        mem_indexes = []
-        mem_pad_masks = []
-        max_segment_length = max(segment_lens) * self.num_memory_vectors
-        culmulative_segment_lens = [sum(segment_lens[:i+1])*self.num_memory_vectors for i in range(len(segment_lens))]
+        pad_manager = padding_manager(sub_batch_sizes=segment_lens)
 
-        for i, segment_length in enumerate(segment_lens):
-            from_index = 0 if i == 0 else culmulative_segment_lens[i-1]
-            to_index = culmulative_segment_lens[i]
-            cur_indexes = torch.arange(from_index, to_index, dtype=torch.long)
-            topad = max_segment_length - cur_indexes.shape[0]
-            cur_indexes = torch.cat([cur_indexes, torch.LongTensor([-1]*topad)]) # -1 as concatenated padding as the last index
-            mem_pad_mask = torch.LongTensor([1]*(to_index-from_index) + [0]*topad)
-            
-            mem_indexes.append(cur_indexes.unsqueeze(0).repeat(segment_length, 1))
-            mem_pad_masks.append(mem_pad_mask.unsqueeze(0).repeat(segment_length, 1))
+        downsampled_lens = calc_length(
+            lengths=length,
+            padding=self.ds_layer.conv.padding[0],
+            kernel_size=self.ds_layer.conv.kernel_size[0],
+            stride=self.ds_layer.conv.stride[0],
+            ceil_mode=True,
+            repeat_num=1
+        )
+        ds_pos_emb = None
 
-        mem_padding_masks = torch.cat(mem_pad_masks, dim=0).bool().to(audio_signal.device)
-        mem_indexes = torch.cat(mem_indexes, dim=0).to(audio_signal.device)
-
-        self.cross_attn_pos_enc.init_batch_pos_embs(segment_lens, audio_signal.device, mem_mask=mem_padding_masks.unsqueeze(-1))
-
-        pad_vector = self.pad_vector.to(audio_signal.device)
-    
         for repeat in range(self.num_repeats): 
-            # map the audio signal to the memory vectors
-            memory_vectors = checkpoint(
-                self.create_custom_forward(self.map_spectogram_to_memory),
-                memory_vectors, # query vectors
-                audio_signal, # key/value vectors
-                None, # query mask
-                ~pad_mask # key/value mask
-            ) + memory_vectors # add the memory vectors as a residual connection
-
-            # rearrane via grouping batch and sequence dimensions
-            memory_sequences = rearrange(memory_vectors, 'b n d -> (b n) d')
-            # cat padding token to use during indexing
-            memory_sequences = torch.cat([memory_sequences, pad_vector], dim=0)
-            # use indexing to get the correct sequence of memory vectors for each segment of utterances
-            memory_sequences = memory_sequences[[mem_indexes]] 
-            # apply relative cross attn positional encoding to the memory sequences
-            memory_sequences = self.cross_attn_pos_enc(memory_sequences)
-
-            get_attn_map = True if return_cross_utterance_attention and repeat == self.num_repeats-1 else False # only return the attention map for the last repeat
-            # now cross attention between memory vectors and memory sequences
-            mem_attn_out = checkpoint(
-                self.create_custom_forward(self.cross_conformer_layer), 
-                memory_vectors, # x
-                memory_sequences, # context
-                None, # x mask
-                mem_padding_masks, # context mask
-                get_attn_map # whether to return the cross-utterance attention
+            ds_audio = self.ds_layer(self.ds_layer.autopad(audio_signal, self.ds_layer.conv.stride[0]))
+           
+            ds_audio = ds_audio[:, :downsampled_lens.max(), :]
+           
+            ds_sb_audio, ds_sb_masks = pad_manager.convert_to_subbatches(ds=ds_audio, ds_lengths=downsampled_lens)
+            
+            ds_sb_attn_mask = pad_mask_to_attn_mask(ds_sb_masks)
+            
+            if ds_pos_emb == None:
+                ds_sb_audio, ds_pos_emb = self.pos_enc(ds_sb_audio)
+            
+         
+            ds_sb_audio = checkpoint(
+                self.create_custom_forward(self.ds_sequence_conformer_layer),
+                    ds_sb_audio, # x
+                    ds_sb_attn_mask, # attn_mask
+                    ds_pos_emb, # pos_emb
+                    ds_sb_masks, # pad_mask
+                
             )
-            memory_vectors, attn_map = mem_attn_out if get_attn_map == True else (mem_attn_out, None)
-
-            # map the memory vectors back to the audio signal
-            audio_signal = checkpoint(
-                self.create_custom_forward(self.map_memory_to_spectogram),
-                    audio_signal, # query vectors
-                    memory_vectors, # key/value vectors
-                    ~pad_mask, # query mask
-                    None # key/value mask
-            ) + audio_signal # add the audio signal as a residual connection
-
-            # now for self attention over the audio_signal
+            ds_reverted_audio = pad_manager.revert_from_subbatches(ds_sb_audio)
+            reverted_audio = self.upsample_layer(ds_reverted_audio, self.ds_layer.conv.stride[0])
+           
+            reverted_audio = reverted_audio[:,:audio_signal.size(1),:]
+           
+            reverted_audio = reverted_audio.masked_fill(pad_mask.unsqueeze(-1), 0)
+            audio_signal = audio_signal + reverted_audio
+            
     
             if repeat != self.num_repeats - 1:
                 audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer), audio_signal, att_mask, pos_emb, pad_mask)
@@ -536,6 +473,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         interim_posteriors = torch.stack(interim_posteriors, dim=0)
      
         main_outputs = (out_signal, interim_posteriors, length)
+        attn_map = None
         additional_outputs = {'attn_map': attn_map}
         return main_outputs if attn_map is None else main_outputs + (additional_outputs,)
 
@@ -599,3 +537,132 @@ Register any additional information
 """
 if adapter_mixins.get_registered_adapter(CtxConformerEncoder) is None:
     adapter_mixins.register_adapter(base_class=CtxConformerEncoder, adapter_class=CtxConformerEncoderAdapter)
+
+
+def calc_length(lengths, padding, kernel_size, stride, ceil_mode, repeat_num=1):
+    """ Calculates the output length of a Tensor passed through a convolution or max pooling layer"""
+    add_pad: float = (padding * 2) - kernel_size
+    one: float = 1.0
+    for i in range(repeat_num):
+        lengths = torch.div(lengths.to(dtype=torch.float) + add_pad, stride) + one
+        if ceil_mode:
+            lengths = torch.ceil(lengths)
+        else:
+            lengths = torch.floor(lengths)
+    return lengths.to(dtype=torch.long)
+
+
+
+class downsample_layer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=5, stride=10, padding=0, expansion_factor=2):
+        super(downsample_layer, self).__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels*expansion_factor, kernel_size, stride, padding)
+        self.relu = nn.ReLU()
+        self.ffn = nn.Linear(out_channels*expansion_factor, out_channels)
+        self.swish = lambda x: x * torch.sigmoid(x)
+
+    @staticmethod
+    def autopad(x, stride):
+        '''  
+        Adds padding so sequence length is divisible my stride
+        '''
+        topad = ((torch.tensor((x.size(1)/stride)).ceil() - x.size(1)/stride)*stride).ceil().long()
+        if topad > 0:
+            x = torch.cat([x, torch.zeros(x.size(0), topad, x.size(-1)).to(x.device)], dim=1)
+        return x
+
+    def forward(self, x, mask=None):
+        x = self.conv(x.transpose(1,2)).transpose(1,2)
+        x = self.relu(x)
+        x = self.ffn(x)
+        x = self.swish(x)
+        return x.masked_fill(mask, 0.0) if mask is not None else x
+
+
+def upsample_fn(x, scale_factor):
+    return x.repeat_interleave(scale_factor, dim=1)
+
+
+class padding_manager():
+    def __init__(self, sub_batch_sizes):
+        self.sb_indices = None
+        self.sb_masks = None
+        self.revert_indices = None
+        self.sub_batch_sizes = sub_batch_sizes
+
+        self.ds_lengths = None
+        self.ds_total_sb_lengths = None
+        self.max_ds_total_sb_lengths = None
+      
+    def convert_to_subbatches(self, ds, ds_lengths):
+        self.ds_lengths = ds_lengths
+        b, t, d, sub_batch_sizes = *ds.shape, self.sub_batch_sizes
+        flat_sequences = rearrange(ds, 'b t d -> (b t) d')
+        padding_index = torch.zeros(1, d).to(ds.device)
+        flat_sequence_with_padding_index = torch.cat([flat_sequences, padding_index], dim=0)
+        if self.sb_indices != None:
+            return flat_sequence_with_padding_index[self.sb_indices], self.sb_masks
+
+        ds_sb_lengths = torch.split(ds_lengths, sub_batch_sizes.tolist()) # list of utterance lengths within each sub-batch
+        max_ds_lengths = torch.full((b,), ds_lengths.max(), dtype=torch.long, device=ds.device) # max length of utterance in each sub-batch i.e with the padding
+        culm_max_ds_lengths = torch.cumsum(max_ds_lengths, dim=0) # culmulative sum of max lengths of utterances in each sub-batch
+        culm_max_ds_lengths_start = culm_max_ds_lengths - ds_lengths.max() # start of each utterance in the flat sequence
+        # split these into sub-batches
+        culm_max_ds_lengths_start_sb = torch.split(culm_max_ds_lengths_start, sub_batch_sizes.tolist()) # list of start indices of each utterance in each sub-batch within the flat sequence
+        culm_ds_lengths_end_sb = torch.split(culm_max_ds_lengths_start + ds_lengths, sub_batch_sizes.tolist()) # list of end indices of each utterance in each sub-batch within the flat sequence
+        ds_total_sb_lengths = [el.sum().item() for el in torch.split(ds_lengths, sub_batch_sizes.tolist())] # list of total lengths of each sub-batch
+        self.ds_total_sb_lengths = ds_total_sb_lengths
+        max_ds_total_sb_lengths = max(ds_total_sb_lengths) # max total length of all sub-batches
+        self.max_ds_total_sb_lengths = max_ds_total_sb_lengths
+        # now get the indices
+        all_sb_indices = []
+        all_sb_pad_masks = []
+        for culm_max_ds_length_start_sb, culm_ds_length_end_sb in zip(culm_max_ds_lengths_start_sb, culm_ds_lengths_end_sb):
+            sb_indices = []
+            for start, end in zip(culm_max_ds_length_start_sb, culm_ds_length_end_sb):
+                sb_indices.append(torch.arange(start, end))
+            sb_indices = torch.cat(sb_indices)
+            diff_from_max_length = max_ds_total_sb_lengths - sb_indices.shape[0]
+            # pad with -1 which will be used to grab the padding from the flat sequence
+            sb_indices = torch.cat([sb_indices, torch.full((diff_from_max_length,), -1, dtype=torch.long)])
+            cur_pad_mask = torch.zeros(sb_indices.shape[0], dtype=torch.bool) # create a mask for the padding
+            cur_pad_mask[sb_indices == -1] = True # set the padding mask to True where the padding is ;)
+            all_sb_pad_masks.append(cur_pad_mask)
+            all_sb_indices.append(sb_indices)
+        all_sb_pad_masks = torch.stack(all_sb_pad_masks)
+        all_sb_indices = torch.stack(all_sb_indices)
+        # okay now we have the indices, we can grab the flat sequences
+        all_sb_pad_masks = all_sb_pad_masks.to(ds.device)
+        self.sb_indices = all_sb_indices
+        self.sb_masks = all_sb_pad_masks
+        return flat_sequence_with_padding_index[all_sb_indices], all_sb_pad_masks
+
+
+    def revert_from_subbatches(self, ds_sb_sequences):
+        assert self.sb_indices != None, "You need to call convert_to_subbatches first"
+        b, t, d, sub_batch_sizes, ds_lengths, max_ds_total_sb_lengths, ds_total_sb_lengths = *ds_sb_sequences.shape, self.sub_batch_sizes, self.ds_lengths, self.max_ds_total_sb_lengths, self.ds_total_sb_lengths
+        reflat_sequences = rearrange(ds_sb_sequences, 'b t d -> (b t) d')
+        padding_index = torch.zeros(1, d).to(ds_sb_sequences.device)
+        reflat_sequence_with_padding_index = torch.cat([reflat_sequences, padding_index], dim=0)
+        
+        if self.revert_indices != None:
+            return reflat_sequence_with_padding_index[self.revert_indices]
+
+        ds_sb_lengths = torch.split(ds_lengths, sub_batch_sizes.tolist())
+        all_revert_indices = []
+        pos = 0
+
+        for ds_sb_length, ds_total_sb_length in zip(ds_sb_lengths, ds_total_sb_lengths):
+            cur_revert_indices = []
+            for utt_length in ds_sb_length:
+                cur_indices = torch.arange(pos, pos+utt_length)
+                diff_from_max_length = ds_lengths.max() - cur_indices.shape[0]
+                cur_indices = torch.cat([cur_indices, torch.full((diff_from_max_length,), -1, dtype=torch.long)])
+                cur_revert_indices.append(cur_indices)
+                pos += utt_length
+            pos += max_ds_total_sb_lengths - ds_total_sb_length
+            all_revert_indices.append(torch.stack(cur_revert_indices))
+        all_revert_indices = torch.cat(all_revert_indices)
+
+        self.revert_indices = all_revert_indices
+        return reflat_sequence_with_padding_index[all_revert_indices]
