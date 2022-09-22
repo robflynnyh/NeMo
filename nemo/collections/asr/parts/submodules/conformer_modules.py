@@ -110,7 +110,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
     def slice_mem_tokens(x, num_mem_tokens):
         return x[:, :num_mem_tokens, :], x[:, num_mem_tokens:, :]
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, num_memory_vectors=None, mem_pos_emb=None):
+    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, num_memory_vectors=None, mem_pos_emb=None, return_attentions=False):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -128,11 +128,12 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         x = self.norm_self_att(residual)
         #print(x.shape, pos_emb.shape, 'attn stuff')
         if self.self_attention_model == 'rel_pos':
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb)
+            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb, return_attentions=return_attentions)
         elif self.self_attention_model == 'abs_pos':
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask)
+            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, return_attentions=return_attentions)
         else:
             x = None
+        x, attns = x if return_attentions else (x, None)
         residual = residual + self.dropout(x)
 
         conv_pad_mask = pad_mask
@@ -166,7 +167,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         if self.is_access_enabled():
             self.register_accessible_tensor(tensor=x)
 
-        return x
+        return x if not return_attentions else (x, attns)
 
 
 

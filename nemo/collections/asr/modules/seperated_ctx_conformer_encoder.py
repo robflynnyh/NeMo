@@ -47,6 +47,8 @@ def pad_mask_to_attn_mask(pad_mask):
     """Converts padding mask to attention mask."""
     return rearrange(pad_mask, 'b i -> b i ()') * rearrange(pad_mask, 'b j -> b () j')
 
+
+
 class CtxConformerEncoder(NeuralModule, Exportable):
     """
     The encoder for ASR model of Conformer.
@@ -134,6 +136,8 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         n_layers,
         d_model,
         feat_out=-1,
+        n_ds_layers=4,
+        n_full_folded_layers=3,
         subsampling='striding',
         subsampling_factor=4,
         subsampling_conv_channels=-1,
@@ -249,7 +253,28 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             )
             self.layers.append(layer)
 
-        self.repeated_conformer_layer = ConformerLayer( # full seq layer
+        self.repeated_conformer_layers = nn.ModuleList()
+
+        for _ in range(n_full_folded_layers):
+            repeated_conformer_layer = ConformerLayer( # full seq layer
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    self_attention_model=self_attention_model,
+                    n_heads=n_heads,
+                    conv_kernel_size=conv_kernel_size,
+                    conv_norm_type=conv_norm_type,
+                    dropout=dropout,
+                    dropout_att=dropout_att,
+                    pos_bias_u=pos_bias_u,
+                    pos_bias_v=pos_bias_v,
+                    sparse_topk = sparse_topk,
+                    weight_standardization=weight_standardization
+            )
+            self.repeated_conformer_layers.append(repeated_conformer_layer)
+
+        self.ds_sequence_conformer_layers = nn.ModuleList()
+        for _ in range(n_ds_layers):
+            ds_sequence_conformer_layer = ConformerLayer( # ds seq layer
                 d_model=d_model,
                 d_ff=d_ff,
                 self_attention_model=self_attention_model,
@@ -262,32 +287,18 @@ class CtxConformerEncoder(NeuralModule, Exportable):
                 pos_bias_v=pos_bias_v,
                 sparse_topk = sparse_topk,
                 weight_standardization=weight_standardization
-        )
+            )
+            self.ds_sequence_conformer_layers.append(ds_sequence_conformer_layer)
 
-        self.ds_sequence_conformer_layer = ConformerLayer( # full seq layer
-            d_model=d_model,
-            d_ff=d_ff,
-            self_attention_model=self_attention_model,
-            n_heads=n_heads,
-            conv_kernel_size=conv_kernel_size,
-            conv_norm_type=conv_norm_type,
-            dropout=dropout,
-            dropout_att=dropout_att,
-            pos_bias_u=pos_bias_u,
-            pos_bias_v=pos_bias_v,
-            sparse_topk = sparse_topk,
-            weight_standardization=weight_standardization
-        )
-
-        self.ds_layer = downsample_layer(
+        self.down_and_up_module = upsample_downsample_module(
             in_channels=d_model,
             out_channels=d_model,
-            kernel_size=5,
-            stride=5,
-            padding=0,
-            expansion_factor=2
+            kernel_size=4, 
+            stride=2, 
+            padding=1, 
+            num_repeats=3, 
+            ceil_mode=True
         )
-        self.upsample_layer = upsample_fn
 
 
         self.self_condition = self_condition
@@ -360,7 +371,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
         max_audio_length: int = audio_signal.size(-1)
 
         if segment_lens == None:
-            segment_lens = [audio_signal.shape[0]] # assume segment is the entire batch if not specified
+            segment_lens = torch.as_tensor([audio_signal.shape[0]], dtype=torch.int32) 
 
         if max_audio_length > self.max_audio_length:
             self.set_max_audio_length(max_audio_length)
@@ -413,20 +424,12 @@ class CtxConformerEncoder(NeuralModule, Exportable):
 
         pad_manager = padding_manager(sub_batch_sizes=segment_lens)
 
-        downsampled_lens = calc_length(
-            lengths=length,
-            padding=self.ds_layer.conv.padding[0],
-            kernel_size=self.ds_layer.conv.kernel_size[0],
-            stride=self.ds_layer.conv.stride[0],
-            ceil_mode=True,
-            repeat_num=1
-        )
+       
         ds_pos_emb = None
 
         for repeat in range(self.num_repeats): 
-            ds_audio = self.ds_layer(self.ds_layer.autopad(audio_signal, self.ds_layer.conv.stride[0]))
-           
-            ds_audio = ds_audio[:, :downsampled_lens.max(), :]
+            ds_audio, downsampled_lens, upsample_fn = self.down_and_up_module(audio_signal, length)
+            #ds_audio = ds_audio[:, :downsampled_lens.max(), :]
            
             ds_sb_audio, ds_sb_masks = pad_manager.convert_to_subbatches(ds=ds_audio, ds_lengths=downsampled_lens)
             
@@ -439,30 +442,32 @@ class CtxConformerEncoder(NeuralModule, Exportable):
 
             if ds_pos_emb == None:
                 ds_sb_audio, ds_pos_emb = self.pos_enc(ds_sb_audio)
-         
-            ds_sb_audio = checkpoint(
-                self.create_custom_forward(self.ds_sequence_conformer_layer),
-                    ds_sb_audio, # x
-                    ds_sb_attn_mask, # attn_mask
-                    ds_pos_emb, # pos_emb
-                    ds_sb_masks, # pad_mask
-                
-            )
+
+            return_attentions = False if return_cross_utterance_attention == False or repeat < self.num_repeats - 1 else True
+            for lth, ds_sequence_conformer_layer in enumerate(self.ds_sequence_conformer_layers):
+                ds_sb_audio = checkpoint(
+                    self.create_custom_forward(ds_sequence_conformer_layer),
+                        ds_sb_audio, # x
+                        ds_sb_attn_mask, # attn_mask
+                        ds_pos_emb, # pos_emb
+                        ds_sb_masks, # pad_mask
+                        None,
+                        None,
+                        return_attentions
+                )
+                ds_sb_audio, cross_attns = ds_sb_audio if return_attentions else (ds_sb_audio, None) # should add cross_attns to list so it's not overwritten :{
+
             ds_reverted_audio = pad_manager.revert_from_subbatches(ds_sb_audio)
-            reverted_audio = self.upsample_layer(ds_reverted_audio, self.ds_layer.conv.stride[0])
-           
-            reverted_audio = reverted_audio[:,:audio_signal.size(1),:]
-           
-            reverted_audio = reverted_audio.masked_fill(pad_mask.unsqueeze(-1), 0)
-            audio_signal = audio_signal + reverted_audio
-            
-    
-            if repeat != self.num_repeats - 1:
-                audio_signal = checkpoint(self.create_custom_forward(self.repeated_conformer_layer), audio_signal, att_mask, pos_emb, pad_mask)
-                audio_signal, interim_log_posterior = self.selfconditioning(audio_signal, decoder) # SC-CTC
-                interim_posteriors.append(interim_log_posterior)
-            else: # don't checkpoint grad on last layer
-                audio_signal = self.repeated_conformer_layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
+            reverted_audio = upsample_fn(ds_reverted_audio)
+            audio_signal = reverted_audio
+
+            for lth, repeated_conformer_layer in enumerate(self.repeated_conformer_layers):
+                if repeat != self.num_repeats - 1 or lth != len(self.repeated_conformer_layers) - 1:
+                    audio_signal = checkpoint(self.create_custom_forward(repeated_conformer_layer), audio_signal, att_mask, pos_emb, pad_mask)
+                    audio_signal, interim_log_posterior = self.selfconditioning(audio_signal, decoder) # SC-CTC
+                    interim_posteriors.append(interim_log_posterior)
+                else: # don't checkpoint grad on last layer
+                    audio_signal = repeated_conformer_layer(x=audio_signal, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask)
         
         #########################
 
@@ -473,12 +478,12 @@ class CtxConformerEncoder(NeuralModule, Exportable):
 
         out_signal = torch.transpose(out_signal, 1, 2) # (batch, seq_len, d_model) -> (batch, d_model, seq_len) 
 
-        # stack the posteriors along the first dimension (height, batch, seq_len, dim)
+        # stack the posteriors along the first dimension (height, batch, d_model, seq_len)
         interim_posteriors = torch.stack(interim_posteriors, dim=0)
      
         main_outputs = (out_signal, interim_posteriors, length)
-        attn_map = None
-        additional_outputs = {'attn_map': attn_map}
+        attn_map = cross_attns
+        additional_outputs = {'attn_map': attn_map, 'ds_lengths': downsampled_lens}
         return main_outputs if attn_map is None else main_outputs + (additional_outputs,)
 
 
@@ -556,8 +561,85 @@ def calc_length(lengths, padding, kernel_size, stride, ceil_mode, repeat_num=1):
     return lengths.to(dtype=torch.long)
 
 
+class upsample_downsample_module(nn.Module):
+    '''
+    Performs downsampling then returns a function that can be used to upsample the output
+    '''
+    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, padding=1, num_repeats=3, ceil_mode=True):
+        super(upsample_downsample_module, self).__init__()
+        self.downsample = downsample_layer(in_channels, out_channels, kernel_size, stride, padding, num_repeats, ceil_mode)
+        self.upsample = upsample_layer(out_channels, in_channels, kernel_size, stride, padding, num_repeats, ceil_mode)
+
+    def forward(self, x, length):
+        x, masks, residuals, pad_n, ds_lengths = self.downsample(x, length)
+        return x, ds_lengths, lambda z: self.upsample(z, masks, residuals, pad_n)
+        
 
 class downsample_layer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, padding=1, num_repeats=3, ceil_mode=True):
+        super(downsample_layer, self).__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.activation = nn.ReLU()
+        self.num_repeats = num_repeats
+        self.ceil_mode = ceil_mode
+        self.stride = stride
+
+    @staticmethod
+    def padder(x, divisible):
+        '''
+        Pads so that the length is divisible by the given number
+        '''
+        pad_n = (divisible - x.shape[1] % divisible) % divisible
+        return torch.cat([x, torch.zeros(x.shape[0], pad_n, x.shape[2], device=x.device)], dim=1), pad_n
+
+    def forward(self, x, length):
+        to_be_divisible = self.stride ** self.num_repeats
+        b, n, c = x.shape
+        inp_mask = torch.arange(n, device=x.device).expand(b, n) < length.unsqueeze(1)
+        masks = [inp_mask]
+        residuals = [x]
+        ds_lengths = length
+        x, pad_n = self.padder(x, to_be_divisible)
+        
+        for i in range(self.num_repeats):
+            x = self.conv(x.transpose(1, 2)).transpose(1, 2)
+            x = self.activation(x)
+            ds_lengths = calc_length(ds_lengths, self.conv.padding[0], self.conv.kernel_size[0], self.conv.stride[0], self.ceil_mode)
+            mask = torch.arange(x.shape[1], device=x.device).expand(b, x.shape[1]) >= ds_lengths.unsqueeze(1)
+            masks.append(mask)
+            x = x.masked_fill(mask.unsqueeze(-1), 0)
+            residuals.append(x)
+        
+        # remove last item and reverse
+        masks = masks[:-1][::-1]
+        residuals = residuals[:-1][::-1]
+
+        return x, masks, residuals, pad_n, ds_lengths
+        
+class upsample_layer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, padding=1, num_repeats=3, ceil_mode=True):
+        super(upsample_layer, self).__init__()
+        self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.residual_merge_layer = nn.Linear(out_channels*2, out_channels)
+        self.merge_residual_fn = lambda x, residual: self.residual_merge_layer(torch.cat([x, residual], dim=-1))
+        self.activation = nn.ReLU()
+        self.num_repeats = num_repeats
+        self.ceil_mode = ceil_mode
+        self.stride = stride
+
+    def forward(self, x, masks, residuals, pad_n):
+        for i in range(self.num_repeats):
+            x = self.conv(x.transpose(1, 2)).transpose(1, 2)
+            x = self.activation(x)
+            if i == self.num_repeats - 1:
+                x = x[:, :(x.shape[1] - pad_n), :]
+            x = x.masked_fill(masks[i].unsqueeze(-1), 0)
+            #x = x + residuals[i]
+            x = self.merge_residual_fn(x, residuals[i])
+        return x
+
+'''
+class _downsample_layer(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=5, stride=10, padding=0, expansion_factor=2):
         super(downsample_layer, self).__init__()
         self.conv = nn.Conv1d(in_channels, out_channels*expansion_factor, kernel_size, stride, padding)
@@ -567,9 +649,7 @@ class downsample_layer(nn.Module):
 
     @staticmethod
     def autopad(x, stride):
-        '''  
-        Adds padding so sequence length is divisible my stride
-        '''
+
         topad = ((torch.tensor((x.size(1)/stride)).ceil() - x.size(1)/stride)*stride).ceil().long()
         if topad > 0:
             x = torch.cat([x, torch.zeros(x.size(0), topad, x.size(-1)).to(x.device)], dim=1)
@@ -585,6 +665,7 @@ class downsample_layer(nn.Module):
 
 def upsample_fn(x, scale_factor):
     return x.repeat_interleave(scale_factor, dim=1)
+'''
 
 
 class padding_manager():
@@ -639,6 +720,7 @@ class padding_manager():
         all_sb_pad_masks = all_sb_pad_masks.to(ds.device)
         self.sb_indices = all_sb_indices
         self.sb_masks = all_sb_pad_masks
+        
         return flat_sequence_with_padding_index[all_sb_indices], all_sb_pad_masks
 
 

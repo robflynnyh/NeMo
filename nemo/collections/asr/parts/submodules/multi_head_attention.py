@@ -92,7 +92,7 @@ class MultiHeadAttention(nn.Module):
 
         return q, k, v
 
-    def forward_attention(self, value, scores, mask):
+    def forward_attention(self, value, scores, mask, return_attentions=False):
         """Compute attention context vector.
         Args:
             value (torch.Tensor): (batch, time2, size)
@@ -122,9 +122,9 @@ class MultiHeadAttention(nn.Module):
         x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
         x = x.transpose(1, 2).reshape(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
 
-        return self.linear_out(x)  # (batch, time1, d_model)
+        return self.linear_out(x) if not return_attentions else (self.linear_out(x), attn)
 
-    def forward(self, query, key, value, mask, pos_emb=None):
+    def forward(self, query, key, value, mask, pos_emb=None, return_attentions=False):
         """Compute 'Scaled Dot Product Attention'.
         Args:
             query (torch.Tensor): (batch, time1, size)
@@ -137,7 +137,7 @@ class MultiHeadAttention(nn.Module):
         q, k, v = self.forward_qkv(query, key, value)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / self.s_d_k
-        return self.forward_attention(v, scores, mask)
+        return self.forward_attention(v, scores, mask, return_attentions=return_attentions)
 
 
 class RelPositionMultiHeadAttention(MultiHeadAttention):
@@ -176,11 +176,11 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         # need to add a column of zeros on the left side of last dimension to perform the relative shifting
         x = torch.nn.functional.pad(x, pad=(1, 0))  # (b, h, t1, t2+1)
         x = x.view(b, h, -1, qlen)  # (b, h, t2+1, t1)
-        # need to drop the first row
-        x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2)
+        # need to drop the first row 
+        x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2) 
         return x
 
-    def forward(self, query, key, value, mask, pos_emb, mem_pos_emb=None):
+    def forward(self, query, key, value, mask, pos_emb, mem_pos_emb=None, return_attentions=False):
         """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
         Args:
             query (torch.Tensor): (batch, time1, size)
@@ -200,6 +200,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         q = q.transpose(1, 2)  # (batch, time1, head, d_k)
 
         n_batch_pos = pos_emb.size(0)
+       
         p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
@@ -217,13 +218,13 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         # compute matrix b and matrix d
         # (batch, head, time1, time2)
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
-        matrix_bd = self.rel_shift(matrix_bd)
+        matrix_bd = self.rel_shift(matrix_bd) # ahh
         # drops extra elements in the matrix_bd to match the matrix_ac's size
         matrix_bd = matrix_bd[:, :, :, : matrix_ac.size(-1)]
 
         scores = (matrix_ac + matrix_bd) / self.s_d_k  # (batch, head, time1, time2)
        
-        return self.forward_attention(v, scores, mask)
+        return self.forward_attention(v, scores, mask, return_attentions=return_attentions)
 
 
 class PositionalEncoding(torch.nn.Module):
@@ -326,7 +327,9 @@ class RelPositionalEncoding(PositionalEncoding):
         # for input of length L, 2*L-1 positions are needed, positions from (L-1) to -(L-1)
         start_pos = self.center_pos - x.size(1)
         end_pos = self.center_pos + x.size(1) - 1
+     
         pos_emb = self.pe[:, start_pos:end_pos]
+  
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
         return self.dropout(x), pos_emb
