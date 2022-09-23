@@ -595,7 +595,7 @@ class downsample_layer(nn.Module):
     def forward(self, x, length):
         to_be_divisible = self.stride ** self.num_repeats
         b, n, c = x.shape
-        inp_mask = torch.arange(n, device=x.device).expand(b, n) < length.unsqueeze(1)
+        inp_mask = torch.arange(n, device=x.device).expand(b, n) >= length.unsqueeze(1)
         masks = [inp_mask]
         residuals = [x]
         ds_lengths = length
@@ -685,10 +685,11 @@ class padding_manager():
         flat_sequences = rearrange(ds, 'b t d -> (b t) d')
         padding_index = torch.zeros(1, d).to(ds.device)
         flat_sequence_with_padding_index = torch.cat([flat_sequences, padding_index], dim=0)
-        if self.sb_indices != None:
+
+        if self.sb_indices != None: # if cached then don't recompute
             return flat_sequence_with_padding_index[self.sb_indices], self.sb_masks
 
-        ds_sb_lengths = torch.split(ds_lengths, sub_batch_sizes.tolist()) # list of utterance lengths within each sub-batch
+        #ds_sb_lengths = torch.split(ds_lengths, sub_batch_sizes.tolist()) # list of utterance lengths within each sub-batch
         max_ds_lengths = torch.full((b,), ds_lengths.max(), dtype=torch.long, device=ds.device) # max length of utterance in each sub-batch i.e with the padding
         culm_max_ds_lengths = torch.cumsum(max_ds_lengths, dim=0) # culmulative sum of max lengths of utterances in each sub-batch
         culm_max_ds_lengths_start = culm_max_ds_lengths - ds_lengths.max() # start of each utterance in the flat sequence
@@ -731,7 +732,7 @@ class padding_manager():
         padding_index = torch.zeros(1, d).to(ds_sb_sequences.device)
         reflat_sequence_with_padding_index = torch.cat([reflat_sequences, padding_index], dim=0)
         
-        if self.revert_indices != None:
+        if self.revert_indices != None: # if cached then don't recompute
             return reflat_sequence_with_padding_index[self.revert_indices]
 
         ds_sb_lengths = torch.split(ds_lengths, sub_batch_sizes.tolist())
