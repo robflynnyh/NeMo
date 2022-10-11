@@ -337,7 +337,6 @@ class RelPositionSinusoidalGAU(nn.Module):
             output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
         """
         #q, k, v = self.forward_qkv(query, key, value)
-        print(qkv.shape, 'qkv')
         qk = self.to_qk(qkv)
         v, gate = self.to_hidden(qkv).chunk(2, dim=-1)
         q, k = self.offset_scale(qk)
@@ -396,9 +395,7 @@ class RelPositionSinusoidalGAU(nn.Module):
         p_attn = self.dropout(attn)
 
         out = einsum("b i j, b j d -> b i d", p_attn, v)  # (batch, time1, d_model)
-        print(out.shape, 'out')
         out = out * gate
-        print(out.shape, 'out2')
         out = self.to_out(out)
 
         return out if isfalse(return_attentions) else (out, attn)

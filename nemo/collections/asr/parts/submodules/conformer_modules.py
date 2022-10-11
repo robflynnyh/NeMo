@@ -64,7 +64,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         weight_standardization=False,
         num_memory_vectors=None,
         GAU=False, # whether to use 1-headed Gated Attention Unit
-        qk_dim_divisor=2, # for GAU
+        qk_dim_divisor=4, # for GAU
     ):
         super(ConformerLayer, self).__init__()
 
