@@ -136,10 +136,14 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         self_condition=True,
         conv_kernel_size=31,
         conv_norm_type='batch_norm',
+        weight_standardization=False, # for conv layers
+        sparse_topk=None, # sparse topk attention
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
         checkpoint_every_n_layers=0,
+        GAU=False, # https://arxiv.org/pdf/2202.10447.pdf
+        qk_dim_divisor=4, # for GAU
     ):
         super().__init__()
 
@@ -223,6 +227,10 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 dropout_att=dropout_att,
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
+                weight_standardization=weight_standardization,
+                sparse_topk=sparse_topk,
+                GAU=GAU,
+                qk_dim_divisor=qk_dim_divisor,
             )
             self.layers.append(layer)
 

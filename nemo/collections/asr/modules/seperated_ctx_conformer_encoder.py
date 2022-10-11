@@ -432,6 +432,7 @@ class CtxConformerEncoder(NeuralModule, Exportable):
             #ds_audio = ds_audio[:, :downsampled_lens.max(), :]
            
             ds_sb_audio, ds_sb_masks = pad_manager.convert_to_subbatches(ds=ds_audio, ds_lengths=downsampled_lens)
+            #assert torch.allclose(pad_manager.revert_from_subbatches(ds_sb_audio), ds_audio), "Revert from subbatches failed" # check no errur
             
             ds_sb_attn_mask = pad_mask_to_attn_mask(ds_sb_masks)
             

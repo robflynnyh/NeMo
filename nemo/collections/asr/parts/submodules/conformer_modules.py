@@ -21,11 +21,13 @@ from torch.nn import functional as F
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     MultiHeadAttention,
     RelPositionMultiHeadAttention,
+    RelPositionSinusoidalGAU
 )
 from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.core.classes.mixins import AccessMixin
 from nemo.core.classes.mixins.adapter_mixins import AdapterModuleMixin
 from nemo.utils import logging
+from nemo.collections.asr.parts.utils.helpers import exists, isfalse
 
 from batchrenorm import BatchRenorm1d
 
@@ -61,9 +63,14 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         sparse_topk=None,
         weight_standardization=False,
         num_memory_vectors=None,
+        GAU=False, # whether to use 1-headed Gated Attention Unit
+        qk_dim_divisor=2, # for GAU
     ):
         super(ConformerLayer, self).__init__()
 
+        assert isfalse(GAU) or self_attention_model == 'rel_pos', "GAU is only supported for relative positional attention at the moment"
+
+        self.GAU = GAU
         self.self_attention_model = self_attention_model
         self.n_heads = n_heads
         self.fc_factor = 0.5
@@ -87,9 +94,14 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         # multi-headed self-attention module
         self.norm_self_att = LayerNorm(d_model)
         if self_attention_model == 'rel_pos':
-            self.self_attn = RelPositionMultiHeadAttention(
-                n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v, sparse_topk=self.sparse_topk
-            )
+            if isfalse(GAU):
+                self.self_attn = RelPositionMultiHeadAttention(
+                    n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v, sparse_topk=self.sparse_topk
+                )
+            else:
+                self.self_attn = RelPositionSinusoidalGAU(
+                    n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v, sparse_topk=self.sparse_topk, qk_dim_divisor=qk_dim_divisor
+                )
         elif self_attention_model == 'abs_pos':
             self.self_attn = MultiHeadAttention(n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, sparse_topk=self.sparse_topk)
         else:
@@ -128,7 +140,8 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         x = self.norm_self_att(residual)
         #print(x.shape, pos_emb.shape, 'attn stuff')
         if self.self_attention_model == 'rel_pos':
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb, return_attentions=return_attentions)
+            qkv = {'query': x, 'key': x, 'value': x} if isfalse(self.GAU) else {'qkv': x}
+            x = self.self_attn(**qkv, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb, return_attentions=return_attentions)
         elif self.self_attention_model == 'abs_pos':
             x = self.self_attn(query=x, key=x, value=x, mask=att_mask, return_attentions=return_attentions)
         else:

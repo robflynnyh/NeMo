@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import json
+from locale import normalize
 import os
 import tempfile
 from math import ceil
@@ -545,10 +546,17 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
                 " with ``processed_signal`` and ``processed_signal_len`` arguments."
             )
 
+
+        normalize = self.preprocessor.featurizer.normalize    
+        preprocess_args = {
+            'input_signal': input_signal,
+            'length': input_signal_length,
+            'groups': segment_lens if normalize == 'per_segment' else None
+        }
+        preprocess_args = {k: v for k, v in preprocess_args.items() if v is not None}
+
         if not has_processed_signal:
-            processed_signal, processed_signal_length = self.preprocessor(
-                input_signal=input_signal, length=input_signal_length,
-            )
+            processed_signal, processed_signal_length = self.preprocessor(**preprocess_args)
 
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)

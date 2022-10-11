@@ -46,7 +46,7 @@ from nemo.utils import logging
 CONSTANT = 1e-5
 
 
-def normalize_batch(x, seq_len, normalize_type):
+def normalize_batch(x, seq_len, normalize_type, groups=None):
     if normalize_type == "per_feature":
         x_mean = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
         x_std = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
@@ -70,6 +70,22 @@ def normalize_batch(x, seq_len, normalize_type):
         # make sure x_std is not zero
         x_std += CONSTANT
         return (x - x_mean.view(-1, 1, 1)) / x_std.view(-1, 1, 1)
+    elif normalize_type == "per_segment":
+        groups = x.shape[0] if groups is None else groups # groups is the segment sizes, set to batch size if not specified (would be same as per_feature)
+        x_mean = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
+        x_std = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
+        end_idxs = groups.cumsum(0)
+        start_idxs = end_idxs - groups
+      
+        for i, (start, end) in enumerate(zip(start_idxs, end_idxs)):
+            cur_seq_lens = seq_len[start:end]
+            cur_seq = torch.cat([el[:, :seq_len] for el, seq_len in zip(x[start:end], cur_seq_lens)], dim=1) # cat segments together excluding padding
+            x_mean[start:end, :] = cur_seq.mean(dim=1)
+            x_std[start:end, :] = cur_seq.std(dim=1)
+        # make sure x_std is not zero
+        x_std += CONSTANT
+        return (x - x_mean.unsqueeze(2)) / x_std.unsqueeze(2)
+    
     elif "fixed_mean" in normalize_type and "fixed_std" in normalize_type:
         x_mean = torch.tensor(normalize_type["fixed_mean"], device=x.device)
         x_std = torch.tensor(normalize_type["fixed_std"], device=x.device)
@@ -306,7 +322,7 @@ class FilterbankFeatures(nn.Module):
     def filter_banks(self):
         return self.fb
 
-    def forward(self, x, seq_len):
+    def forward(self, x, seq_len, groups=None):
         seq_len = self.get_seq_len(seq_len.float())
 
         if self.stft_pad_amount is not None:
@@ -360,7 +376,7 @@ class FilterbankFeatures(nn.Module):
 
         # normalize if required
         if self.normalize:
-            x = normalize_batch(x, seq_len, normalize_type=self.normalize)
+            x = normalize_batch(x, seq_len, normalize_type=self.normalize, groups=groups)
 
         # mask to zero any values beyond seq_len in batch, pad to multiple of `pad_to` (for efficiency)
         max_len = x.size(-1)

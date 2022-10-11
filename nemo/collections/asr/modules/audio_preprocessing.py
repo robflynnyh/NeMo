@@ -81,8 +81,8 @@ class AudioPreprocessor(NeuralModule, ABC):
 
     @typecheck()
     @torch.no_grad()
-    def forward(self, input_signal, length):
-        processed_signal, processed_length = self.get_features(input_signal, length)
+    def forward(self, input_signal, length, **kwargs):
+        processed_signal, processed_length = self.get_features(input_signal, length, **kwargs)
 
         return processed_signal, processed_length
 
@@ -177,6 +177,7 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor):
             "length": NeuralType(
                 tuple('B'), LengthsType()
             ),  # Please note that length should be in samples not seconds.
+            "groups": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
     @property
@@ -264,8 +265,8 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor):
             stft_conv=stft_conv,  # Deprecated arguments; kept for config compatibility
         )
 
-    def get_features(self, input_signal, length):
-        return self.featurizer(input_signal, length)
+    def get_features(self, input_signal, length, groups=None):
+        return self.featurizer(input_signal, length, groups)
 
     @property
     def filter_banks(self):
