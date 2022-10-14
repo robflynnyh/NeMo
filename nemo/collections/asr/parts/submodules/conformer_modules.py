@@ -181,8 +181,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             x = self.norm_feed_forward2(residual)
             x = self.feed_forward2(x)
             residual = residual + self.dropout(x) * self.fc_factor
-
-        x = self.norm_out(residual)
+            x = self.norm_out(residual)  # shouldn't do this if GAU is true tbf cus next op is norm if GAU is true i,e two norms in a row
 
         if self.is_adapter_available():
             # Call the adapters
