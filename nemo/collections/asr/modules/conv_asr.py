@@ -36,6 +36,12 @@ from nemo.collections.asr.parts.submodules.tdnn_attention import (
     TDNNSEModule,
 )
 from nemo.collections.asr.parts.utils import adapter_utils
+
+from nemo.collections.asr.parts.utils.helpers import (
+    exists,
+    isfalse,
+)
+
 from nemo.core.classes.common import typecheck
 from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.mixins import adapter_mixins
@@ -524,13 +530,14 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         num_classes, 
         init_mode="xavier_uniform", 
         vocabulary=None, 
-        remove_ctx=False, 
-        gating=False,
-        reproject_type='conv', # linear, conv
-        auxilary_training=False # train reprojection layer using word embedding task
+        remove_ctx=False, # legacy
+        gating=False, # gating didn't help rlly
+        reproject_type='conv', # linear, conv (using linear), concat
+        auxilary_training=False # train reprojection layer using word embedding task (NOT IMPLEMENTED)
     ):
         super().__init__()
 
+        assert not (reproject_type == 'concat' and gating), "concat_reprojection and gating can't be used together"
         assert auxilary_training == False, "Not implemented yet"
         assert reproject_type in ['linear', 'conv'], "reproject_type should be either 'linear' or 'conv'"
         if auxilary_training == True:
@@ -540,7 +547,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
 
         self.auxilary_training = auxilary_training
 
-        if self.auxilary_training == True:
+        if self.auxilary_training == True: # Legacy
             self.left_word_prediction = torch.nn.Linear(
                 feat_in,
                 num_classes
@@ -575,7 +582,8 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
 
         self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim. Change to linear !
             torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) if reproject_type == 'conv' else torch.nn.Linear(self._num_classes, self._feat_in, bias=True)
-        )
+        ) if reproject_type != 'concat' else torch.nn.Linear(self._num_classes + self._feat_in, self._feat_in, bias=True)
+
 
         self.gating = gating
         if self.gating:   
@@ -612,12 +620,18 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
         '''
         Projects the decoder output back to the acoustic models hidden dimension for self-conditioning.
         '''
-        return self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2) if self.reproject_type == 'conv' else self.reprojection_layers(decoder_output)
-      
+        if self.reproject_type != 'concat':
+            return self.reprojection_layers(decoder_output.transpose(1, 2)).transpose(1, 2) if self.reproject_type == 'conv' else self.reprojection_layers(decoder_output)
+        else:
+            return decoder_output # do nothing atm
 
     def integrate_projections(self, encoder_out, proj1):
         if self.gating == False:
-            return encoder_out + proj1
+            if self.reproject_type == 'concat':
+                concat_seq = torch.cat((encoder_out, proj1), dim=-1) # concat along the feature dimension
+                return self.reprojection_layers(concat_seq) # project back to the encoder dimension
+            else:
+                return encoder_out + proj1
         else:
             embedding = proj1
             gating_fn = self.gating_sigmoid(self.weight_hidden(encoder_out) + self.weight_embedding(embedding) + self.gating_bias)
