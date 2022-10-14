@@ -23,12 +23,6 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
     RelPositionMultiHeadAttention,
     RelPositionSinusoidalGAU
 )
-
-from nemo.collections.asr.parts.utils.helpers import (
-    exists,
-    isfalse,
-)
-
 from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.core.classes.mixins import AccessMixin
 from nemo.core.classes.mixins.adapter_mixins import AdapterModuleMixin
@@ -83,10 +77,9 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
 
         self.sparse_topk = sparse_topk
 
-        if isfalse(GAU):
-            # first feed forward module
-            self.norm_feed_forward1 = LayerNorm(d_model)
-            self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+        # first feed forward module
+        self.norm_feed_forward1 = LayerNorm(d_model)
+        self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
 
         # convolution module
         self.norm_conv = LayerNorm(d_model)
@@ -117,10 +110,9 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 f"valid values can be from ['rel_pos', 'abs_pos']"
             )
 
-        if isfalse(GAU):
-            # second feed forward module
-            self.norm_feed_forward2 = LayerNorm(d_model)
-            self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+        # second feed forward module
+        self.norm_feed_forward2 = LayerNorm(d_model)
+        self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
 
 
         self.dropout = nn.Dropout(dropout)
@@ -145,18 +137,17 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         x = self.feed_forward1(x)
         residual = residual + self.dropout(x) * self.fc_factor
 
-        for i in range(1) if isfalse(self.GAU) else range(2):
-            x = self.norm_self_att(residual)
-            #print(x.shape, pos_emb.shape, 'attn stuff')
-            if self.self_attention_model == 'rel_pos':
-                qkv = {'query': x, 'key': x, 'value': x} if isfalse(self.GAU) else {'qkv': x}
-                x = self.self_attn(**qkv, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb, return_attentions=return_attentions)
-            elif self.self_attention_model == 'abs_pos':
-                x = self.self_attn(query=x, key=x, value=x, mask=att_mask, return_attentions=return_attentions)
-            else:
-                x = None
-            x, attns = x if return_attentions else (x, None)
-            residual = residual + self.dropout(x)
+        x = self.norm_self_att(residual)
+        #print(x.shape, pos_emb.shape, 'attn stuff')
+        if self.self_attention_model == 'rel_pos':
+            qkv = {'query': x, 'key': x, 'value': x} if isfalse(self.GAU) else {'qkv': x}
+            x = self.self_attn(**qkv, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb, return_attentions=return_attentions)
+        elif self.self_attention_model == 'abs_pos':
+            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, return_attentions=return_attentions)
+        else:
+            x = None
+        x, attns = x if return_attentions else (x, None)
+        residual = residual + self.dropout(x)
 
         conv_pad_mask = pad_mask
         if exists(num_memory_vectors): # slice out memory vectors from the input to the convolution layer
@@ -176,10 +167,9 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         if exists(num_memory_vectors): # concatenate memory vectors to the output of the convolution layer
             residual = torch.cat([mem_vecs, residual], dim=1)
 
-        if isfalse(self.GAU):
-            x = self.norm_feed_forward2(residual)
-            x = self.feed_forward2(x)
-            residual = residual + self.dropout(x) * self.fc_factor
+        x = self.norm_feed_forward2(residual)
+        x = self.feed_forward2(x)
+        residual = residual + self.dropout(x) * self.fc_factor
 
         x = self.norm_out(residual)
 
