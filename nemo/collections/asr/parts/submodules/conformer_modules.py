@@ -141,9 +141,10 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             x (torch.Tensor): (B, T, d_model)
         """
         residual = x
-        x = self.norm_feed_forward1(x)
-        x = self.feed_forward1(x)
-        residual = residual + self.dropout(x) * self.fc_factor
+        if isfalse(self.GAU):
+            x = self.norm_feed_forward1(x)
+            x = self.feed_forward1(x)
+            residual = residual + self.dropout(x) * self.fc_factor
 
         for i in range(1) if isfalse(self.GAU) else range(2):
             x = self.norm_self_att(residual)
