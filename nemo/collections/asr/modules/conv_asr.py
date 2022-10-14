@@ -539,7 +539,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
 
         assert not (reproject_type == 'concat' and gating), "concat_reprojection and gating can't be used together"
         assert auxilary_training == False, "Not implemented yet"
-        assert reproject_type in ['linear', 'conv'], "reproject_type should be either 'linear' or 'conv'"
+        assert reproject_type in ['linear', 'conv', 'concat'], "reproject_type should be either 'linear' or 'conv' or 'concat'"
         if auxilary_training == True:
             assert reproject_type == 'linear', "reproject_type should be 'linear' when auxilary_training is True"
         
