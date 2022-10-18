@@ -36,6 +36,8 @@ from nemo.collections.asr.modules.adaptive_seperated_ctx_conformer_encoder impor
 
 from nemo.collections.asr.modules.conformer_encoder_grouped_attention import GroupedConformerEncoder
 
+from nemo.collections.asr.modules.scconformer_encoder_BERT import SelfConditionedConformerEncoder as SelfConditionedConformerEncoderBERT
+
 from nemo.collections.asr.modules.conv_asr import (
     ConvASRDecoder,
     ConvASRSelfConditioningDecoder,
