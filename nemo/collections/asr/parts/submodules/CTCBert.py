@@ -161,6 +161,9 @@ class BertEncoderCTC(nn.Module):
         self.project_pos_emb = nn.Linear(acoustic_hidden_size, hidden_size)
 
         self.layers = nn.ModuleList([])
+        self.fuse_input_layers = nn.ModuleList([])
+        self.project_to_acoustic_layers = nn.ModuleList([])
+
         for _ in range(num_encoder_layers):
             layer = BertLayer(
                 hidden_size=hidden_size,
@@ -170,10 +173,12 @@ class BertEncoderCTC(nn.Module):
                 pos_bias_v=pos_bias_v,
             )
             self.layers.append(layer)
+            fuse_input_layer = nn.Linear(hidden_size + ctc_vocab_size, hidden_size)
+            self.fuse_input_layers.append(fuse_input_layer)
+            project_to_acoustic_layer = nn.Linear(hidden_size, acoustic_hidden_size)
+            self.project_to_acoustic_layers.append(project_to_acoustic_layer)
 
-        self.fuse_inputs = nn.Linear(hidden_size + ctc_vocab_size, hidden_size)
-    
-        self.project_to_acoustic = nn.Linear(hidden_size, acoustic_hidden_size)
+        self.initial_residual = nn.Parameter(torch.zeros(1, 1, hidden_size))
 
     def forward(
         self,
@@ -185,18 +190,20 @@ class BertEncoderCTC(nn.Module):
     ):
         assert layer_num >= 0 and layer_num < len(self.layers), f"layer_num must be between 0 and {len(self.layers)}"
         layer = self.layers[layer_num]
+        fuse_inputs, project_to_acoustic = self.fuse_input_layers[layer_num], self.project_to_acoustic_layers[layer_num]
+
         b, n, c = x.shape
-        residual = residual if exists(residual) else torch.zeros(b, n, self.hidden_size, device=x.device)
+        residual = residual if exists(residual) else self.initial_residual.expand(b, n, -1).to(x.device)
 
         x = torch.cat((x, residual), dim=-1) # concat along feature dim
-        x = self.fuse_inputs(x)
+        x = fuse_inputs(x)
         
         pos_emb = self.project_pos_emb(pos_emb) # convert to bert hidden size
 
         x = layer(x, attention_mask=attention_mask, pos_emb=pos_emb)
         
         new_residual = x
-        x = self.project_to_acoustic(x)
+        x = project_to_acoustic(x)
         return x, new_residual
 
     @staticmethod
