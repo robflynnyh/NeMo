@@ -157,7 +157,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
     ):
         super().__init__()
 
-        assert n_layers == 12, "Only 12 layers atm, as this is the size of the pre-trained Roberta model"
+        assert n_layers == 13, "Only 13 layers atm, as 12 is the size of the pre-trained Roberta model"
 
         self.checkpoint_every_n_layers = checkpoint_every_n_layers
 
@@ -256,7 +256,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         self.use_pad_mask = True
 
         self.BERT = BertEncoderCTC(
-            num_encoder_layers = n_layers,
+            num_encoder_layers = n_layers - 1, # not used after the last layer so -1
             hidden_size = 768,
             num_attention_heads = 12,
             dropout_rate_attn = 0.1,
