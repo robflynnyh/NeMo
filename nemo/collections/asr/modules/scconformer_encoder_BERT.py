@@ -257,8 +257,9 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         self.use_pad_mask = True
 
         BERT_n_heads = 12
-        BERT_d_head = BERT_hidden // BERT_n_heads
         BERT_hidden = 768
+        BERT_d_head = BERT_hidden // BERT_n_heads
+        
         pos_bias_u_BERT = nn.Parameter(torch.Tensor(BERT_n_heads, BERT_d_head))
         pos_bias_v_BERT = nn.Parameter(torch.Tensor(BERT_n_heads, BERT_d_head))
         nn.init.zeros_(pos_bias_u_BERT)
