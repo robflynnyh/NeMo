@@ -226,6 +226,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
+
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             layer = ConformerLayer(
@@ -255,13 +256,21 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
 
+        BERT_n_heads = 12
+        BERT_d_head = BERT_hidden // BERT_n_heads
+        BERT_hidden = 768
+        pos_bias_u_BERT = nn.Parameter(torch.Tensor(BERT_n_heads, BERT_d_head))
+        pos_bias_v_BERT = nn.Parameter(torch.Tensor(BERT_n_heads, BERT_d_head))
+        nn.init.zeros_(pos_bias_u_BERT)
+        nn.init.zeros_(pos_bias_v_BERT)
+
         self.BERT = BertEncoderCTC(
             num_encoder_layers = n_layers - 1, # not used after the last layer so -1
-            hidden_size = 768,
-            num_attention_heads = 12,
+            hidden_size = BERT_hidden,
+            num_attention_heads = BERT_n_heads,
             dropout_rate_attn = 0.1,
-            pos_bias_u = pos_bias_u,
-            pos_bias_v = pos_bias_v,
+            pos_bias_u = pos_bias_u_BERT,
+            pos_bias_v = pos_bias_v_BERT,
             ctc_vocab_size = 129, # CHANGE TO A VARIABLE
             acoustic_hidden_size = d_model,
         )
