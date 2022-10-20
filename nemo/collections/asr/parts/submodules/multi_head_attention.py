@@ -35,10 +35,13 @@ Part of this code is adopted from https://github.com/espnet/espnet
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn, einsum
 from nemo.collections.asr.parts.utils.activations import LaplacianAttnFn, ReLUSquared
 from nemo.collections.asr.parts.utils.helpers import exists, isfalse
-from einops import rearrange
+from einops import rearrange, repeat
+from nemo.collections.asr.parts.submodules.dynamic_positions import DynamicPositionBias
+
 
 __all__ = [
     'RelPositionMultiHeadAttention',
@@ -508,3 +511,129 @@ class RelPositionalEncoding(PositionalEncoding):
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
         return self.dropout(x), pos_emb
+
+
+class MyopicAttention(nn.Module):
+    def __init__(
+        self,
+        n_feats,
+        head_dim,
+        n_heads,
+        dropout=0.0,
+        max_keep_keys=50,
+        chunk_window=3,
+        bias=True,
+        return_attention=False,
+    ):
+        super().__init__()
+        self.n_feats = n_feats
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.dropout = dropout
+        self.bias = bias
+        self.return_attention = return_attention
+
+        self.scale = head_dim ** -0.5
+
+        self.max_keep_keys = max_keep_keys
+        self.W = chunk_window
+
+        self.positional_bias = DynamicPositionBias(
+            dim = n_feats,
+            heads = n_heads,
+            depth = 2,
+            log_distance = False,
+            norm = False
+        )
+
+        self.qkv_proj = nn.Linear(n_feats, 3 * n_heads * head_dim, bias=bias)
+        self.out_proj = nn.Linear(n_heads * head_dim, n_feats, bias=bias)
+
+    def pad_to_window_size(self, x, window_size, axis=3, mask=None):
+        """
+        Pad the input on two sides to be divisible by `window_size`
+        """
+        QKV, batch_size, heads, sequence_length, hidden_size = x.shape
+        padding_length = (window_size - sequence_length % window_size) % window_size
+        padding = torch.zeros(QKV, batch_size, heads, padding_length, hidden_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        mask = F.pad(mask, (0, padding_length), value=True) if exists(mask) else None
+        return torch.cat([x, padding], axis=axis), padding_length, mask
+
+    def unpad(self, x, padding_length):
+        """
+        Undo padding.
+        """
+        if padding_length > 0:
+            return x[:, :-padding_length]
+        return x
+
+    def ChunkGrid(self, Total_Size, Block_Size):
+        Psize = Total_Size // Block_Size
+        chunk_grid = (torch.arange(0, Psize).repeat(Psize,1) - torch.arange(0, Psize).repeat(Psize,1).T ).repeat_interleave(Block_Size, dim=1).abs()
+        chunk_grid = 1 - (chunk_grid / chunk_grid.max(dim=-1)[0].unsqueeze(-1))
+        return chunk_grid 
+    
+
+    def forward(self, x, mask=None, return_attention=False):
+        B, N, C, H, D = *x.shape, self.n_heads, self.head_dim
+        tokeep = min(self.max_keep_keys, N) if self.max_keep_keys != -1 else N
+        W = min(self.W, N) if self.W != -1 else N
+        qkv = rearrange(self.qkv_proj(x), "B N (H D QKV) -> QKV B H N D", QKV=3, H=H, D=D)
+
+        qkv, pad_n, mask = self.pad_to_window_size(qkv, W, axis=3, mask=mask)
+        q, kv = qkv[0], qkv[1:]
+        # split q into windows/chunks of size W
+        q = rearrange(q, "B H (N W) D -> B H N W D", W=W)
+        if exists(mask):
+            q_mask = rearrange(mask, "B (N W) -> B N W", W=W)
+            q_mask = repeat(q_mask, "B N W -> B H N W", H=H)
+            
+        # duplicate k and v for total number of windows
+        kv = repeat(kv, "KV B H N D -> KV B H NW N D", NW=q.shape[2])
+        #print(q.shape, kv.shape)
+        KV, B, H, NW, N, D = kv.shape
+
+        chunkgrid = self.ChunkGrid(Total_Size=N, Block_Size=W).to(q.device)
+        
+        chunkgrid = repeat(chunkgrid, "W N -> B H W N", B=B, H=H).contiguous()
+        uniform_dist = torch.distributions.normal.Normal(0, 0.125).sample(chunkgrid.shape).to(q.device)
+        chunkgrid += uniform_dist
+        chunkgrid = repeat(chunkgrid, "B H W N -> KV B H W N", KV=2)
+       
+        keep_indices = chunkgrid.topk(k=tokeep, dim=-1).indices
+        keep_mask = torch.zeros_like(chunkgrid).scatter_(-1, keep_indices, 1).bool()
+   
+        KV, B, H, NW, N, D = kv.shape 
+      
+        kv = kv[keep_mask].reshape(KV, B, H, NW, -1, D)
+
+        if exists(mask):
+            kv_mask = repeat(mask, "B N -> B H NW N", H=H, NW=NW)[keep_mask[0]].reshape(B, H, NW, -1)
+        k, v = kv
+        # NW (number of windows) = P (in below einsum)
+        dots = einsum("B H N P D, B H N Z D -> B H N P Z ", q, k) * self.scale # Z is number of chunks in Q, N is max sequence length after dropping
+
+        ## positional stuff
+        pos_bias = self.positional_bias(N, device=dots.device, dtype=dots.dtype)
+        pos_bias = repeat(pos_bias, 'H I J -> B H I J', B = B)
+        pos_bias = rearrange(pos_bias, 'B H (N W) J -> B H N W J', W = W)
+        pos_bias = pos_bias[repeat(keep_mask[0], 'B H NW N -> B H NW W N', W = W)].reshape(*dots.shape)
+       
+        dots = dots + pos_bias
+
+        if exists(mask):
+            mask_val = -torch.finfo(dots.dtype).max
+            qk_mask = rearrange(q_mask, "B H N W -> B H N W ()") * rearrange(kv_mask, "B H W N -> B H W () N")
+            dots.masked_fill_(qk_mask, mask_val)
+
+        attn = dots.softmax(dim=-1)
+  
+        out = einsum("B H N W Z, B H N Z D -> B H N W D", attn, v)
+        out = rearrange(out, "B H N W D -> B (N W) (H D)")
+        out = self.unpad(out, pad_n)
+        out = self.out_proj(out)
+        return out if not return_attention else (out, attn)
+

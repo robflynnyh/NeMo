@@ -37,6 +37,24 @@ from torch.utils.checkpoint import checkpoint # # gradient/activation checkpoint
 __all__ = ['SelfConditionedConformerEncoder']
 
 
+class dummy_positional_encoding(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def forward(self, x, *args, **kwargs):
+        '''
+        Will spawn an instance of the stored function/class if fn exists
+        '''
+        return x, None if not hasattr(self, 'fn') else self.fn
+
+    def store_fn(self, fn, *args, **kwargs):
+        '''
+        Store a function/class
+        '''
+        self.fn = fn(*args, **kwargs)
+
+    def extend_pe(self, *args, **kwargs):
+        return None
 
 
 class SelfConditionedConformerEncoder(NeuralModule, Exportable):
@@ -143,7 +161,9 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         dropout_att=0.0,
         checkpoint_every_n_layers=0,
         GAU=False, # https://arxiv.org/pdf/2202.10447.pdf # does not work well currently
-        qk_dim_divisor=4, # for GAU
+        qk_dim_divisor = 4, # for GAU
+        max_keep_keys = 64, # myopic attention
+        chunk_window = 8, #
     ):
         super().__init__()
 
@@ -211,6 +231,16 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
             self.pos_enc = PositionalEncoding(
                 d_model=d_model, dropout_rate=dropout, max_len=pos_emb_max_len, xscale=self.xscale
             )
+        elif self_attention_model == "flash":
+            pos_bias_u = None
+            pos_bias_v = None
+            self.pos_enc = dummy_positional_encoding()
+            print(f"Using Flash Attention (with rotary positions)\nfrom: https://github.com/HazyResearch/flash-attention")
+        elif self_attention_model == "myopic":
+            pos_bias_u = None
+            pos_bias_v = None
+            self.pos_enc = dummy_positional_encoding()
+            #self.pos_enc.store_fn()
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
@@ -231,6 +261,8 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 sparse_topk=sparse_topk,
                 GAU=GAU,
                 qk_dim_divisor=qk_dim_divisor,
+                max_keep_keys=max_keep_keys,
+                chunk_window=chunk_window,
             )
             self.layers.append(layer)
 

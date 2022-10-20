@@ -28,15 +28,14 @@ class DynamicPositionBias(nn.Module):
 
         self.mlp.append(nn.Linear(dim, heads))
 
-    def forward(self, qk_dots):
-        n, device, dtype = qk_dots.shape[-1], qk_dots.device, qk_dots.dtype
+    def forward(self, n, device, dtype):
 
         # get the (n x n) matrix of distances
         seq_arange = torch.arange(n, device = device)
         context_arange = torch.arange(n, device = device)
         indices = rearrange(seq_arange, 'i -> i 1') - rearrange(context_arange, 'j -> 1 j')
         indices += (n - 1)
-
+        
         # input to continuous positions MLP
         pos = torch.arange(-n + 1, n, device = device, dtype = dtype)
         pos = rearrange(pos, '... -> ... 1')
@@ -50,4 +49,4 @@ class DynamicPositionBias(nn.Module):
         # get position biases        
         bias = pos[indices]
         bias = rearrange(bias, 'i j h -> h i j')
-        return qk_dots + bias
+        return bias

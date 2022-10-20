@@ -21,7 +21,8 @@ from torch.nn import functional as F
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     MultiHeadAttention,
     RelPositionMultiHeadAttention,
-    RelPositionSinusoidalGAU
+    RelPositionSinusoidalGAU,
+    MyopicAttention
 )
 
 from nemo.collections.asr.parts.utils.helpers import (
@@ -71,8 +72,13 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         num_memory_vectors=None,
         GAU=False, # whether to use 1-headed Gated Attention Unit
         qk_dim_divisor=4, # for GAU
+        max_keep_keys = 64, # myopic attention
+        chunk_window = 8, # myopic attention
     ):
         super(ConformerLayer, self).__init__()
+
+        if self_attention_model == "flash": # flash attention https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/flash_attention.py
+            from flash_attn.flash_attention import FlashMHA 
 
         assert isfalse(GAU) or self_attention_model == 'rel_pos', "GAU is only supported for relative positional attention at the moment"
 
@@ -111,6 +117,23 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 )
         elif self_attention_model == 'abs_pos':
             self.self_attn = MultiHeadAttention(n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, sparse_topk=self.sparse_topk)
+        elif self_attention_model == 'flash':
+            self.self_attn = FlashMHA(
+                embed_dim = d_model,
+                num_heads = n_heads,
+                bias = True,
+                attention_dropout = dropout_att,
+                causal = False,
+                use_rotary_emb = '1d',
+            )
+        elif self_attention_model == 'myopic':
+            self.self_attn = MyopicAttention(
+                n_feats = d_model,
+                head_dim = d_model // n_heads,
+                n_heads = n_heads,
+                max_keep_keys = max_keep_keys,
+                chunk_window = chunk_window,
+            )
         else:
             raise ValueError(
                 f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
@@ -154,6 +177,11 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 x = self.self_attn(**qkv, mask=att_mask, pos_emb=pos_emb, mem_pos_emb=mem_pos_emb, return_attentions=return_attentions)
             elif self.self_attention_model == 'abs_pos':
                 x = self.self_attn(query=x, key=x, value=x, mask=att_mask, return_attentions=return_attentions)
+            elif self.self_attention_model == 'flash':
+                x, weights = self.self_attn(x=x, key_padding_mask=pad_mask, need_weights=return_attentions)
+                x = x if return_attentions is False else (x, weights)
+            elif self.self_attention_model == "myopic":
+                x = self.self_attn(x=x, mask=pad_mask, return_attention=return_attentions)
             else:
                 x = None
             x, attns = x if return_attentions else (x, None)
