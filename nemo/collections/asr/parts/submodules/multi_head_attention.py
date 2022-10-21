@@ -574,8 +574,7 @@ class MyopicAttention(nn.Module):
         Psize = Total_Size // Block_Size
         chunk_grid = (torch.arange(0, Psize).repeat(Psize,1) - torch.arange(0, Psize).repeat(Psize,1).T ).repeat_interleave(Block_Size, dim=1).abs()
         chunk_grid = 1 - (chunk_grid / chunk_grid.max(dim=-1)[0].unsqueeze(-1))
-        return chunk_grid 
-    
+        return chunk_grid    
 
     def forward(self, x, mask=None, return_attention=False):
         B, N, C, H, D = *x.shape, self.n_heads, self.head_dim
@@ -599,19 +598,19 @@ class MyopicAttention(nn.Module):
         chunkgrid = self.ChunkGrid(Total_Size=N, Block_Size=W).to(q.device)
         
         chunkgrid = repeat(chunkgrid, "W N -> B H W N", B=B, H=H).contiguous()
-        uniform_dist = torch.distributions.normal.Normal(0, 0.125).sample(chunkgrid.shape).to(q.device)
+        MEAN = torch.tensor(0, device=q.device, dtype=q.dtype)
+        STD = torch.tensor(0.125, device=q.device, dtype=q.dtype)
+        uniform_dist = torch.distributions.normal.Normal(MEAN, STD).sample(chunkgrid.shape).to(q.device)
         chunkgrid += uniform_dist
         chunkgrid = repeat(chunkgrid, "B H W N -> KV B H W N", KV=2)
        
-        keep_indices = chunkgrid.topk(k=tokeep, dim=-1).indices
-        keep_mask = torch.zeros_like(chunkgrid).scatter_(-1, keep_indices, 1).bool()
-   
+        keep_indices = chunkgrid.topk(k=tokeep, dim=-1, sorted=False).indices.sort(dim=-1).values
         KV, B, H, NW, N, D = kv.shape 
-      
-        kv = kv[keep_mask].reshape(KV, B, H, NW, -1, D)
+        kv = kv.gather(-2, repeat(keep_indices, "KV B H W N -> KV B H W N D", D=D))
 
         if exists(mask):
-            kv_mask = repeat(mask, "B N -> B H NW N", H=H, NW=NW)[keep_mask[0]].reshape(B, H, NW, -1)
+            kv_mask = repeat(mask, "B N -> B H NW N", H=H, NW=NW).gather(-1, keep_indices[0])
+
         k, v = kv
         # NW (number of windows) = P (in below einsum)
         dots = einsum("B H N P D, B H N Z D -> B H N P Z ", q, k) * self.scale # Z is number of chunks in Q, N is max sequence length after dropping
@@ -620,8 +619,9 @@ class MyopicAttention(nn.Module):
         pos_bias = self.positional_bias(N, device=dots.device, dtype=dots.dtype)
         pos_bias = repeat(pos_bias, 'H I J -> B H I J', B = B)
         pos_bias = rearrange(pos_bias, 'B H (N W) J -> B H N W J', W = W)
-        pos_bias = pos_bias[repeat(keep_mask[0], 'B H NW N -> B H NW W N', W = W)].reshape(*dots.shape)
-       
+
+        pos_bias = pos_bias.gather(-1, repeat(keep_indices, "KV B H NW N -> KV B H NW W N", W=W)[0])
+        
         dots = dots + pos_bias
 
         if exists(mask):
