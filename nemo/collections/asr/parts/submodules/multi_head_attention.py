@@ -573,7 +573,7 @@ class MyopicAttention(nn.Module):
     def ChunkGrid(self, Total_Size, Block_Size):
         Psize = Total_Size // Block_Size
         chunk_grid = (torch.arange(0, Psize).repeat(Psize,1) - torch.arange(0, Psize).repeat(Psize,1).T ).repeat_interleave(Block_Size, dim=1).abs()
-        chunk_grid = 1 - (chunk_grid / chunk_grid.max(dim=-1)[0].unsqueeze(-1))
+        #chunk_grid = 1 - (chunk_grid / chunk_grid.max(dim=-1)[0].unsqueeze(-1)) # don't normalize cus it'll stretch the distribution by sequence length
         return chunk_grid    
 
     def forward(self, x, mask=None, return_attention=False):
@@ -596,15 +596,16 @@ class MyopicAttention(nn.Module):
         KV, B, H, NW, N, D = kv.shape
 
         chunkgrid = self.ChunkGrid(Total_Size=N, Block_Size=W).to(q.device)
-        
         chunkgrid = repeat(chunkgrid, "W N -> B H W N", B=B, H=H).contiguous()
-        MEAN = torch.tensor(0, device=q.device, dtype=q.dtype)
-        STD = torch.tensor(0.125, device=q.device, dtype=q.dtype)
-        uniform_dist = torch.distributions.normal.Normal(MEAN, STD).sample(chunkgrid.shape).to(q.device)
-        chunkgrid += uniform_dist
+
+        SCALE = torch.tensor(3.0, device=q.device, dtype=q.dtype)
+        ALPHA = torch.tensor(2.0, device=q.device, dtype=q.dtype)
+        pareto_dist = torch.distributions.pareto.Pareto(SCALE, ALPHA).sample(chunkgrid.shape).to(q.device)
+        chunkgrid = chunkgrid - pareto_dist
+
         chunkgrid = repeat(chunkgrid, "B H W N -> KV B H W N", KV=2)
        
-        keep_indices = chunkgrid.topk(k=tokeep, dim=-1, sorted=False).indices.sort(dim=-1).values
+        keep_indices = chunkgrid.topk(k=tokeep, dim=-1, sorted=False, largest=False).indices.sort(dim=-1).values
         KV, B, H, NW, N, D = kv.shape 
         kv = kv.gather(-2, repeat(keep_indices, "KV B H W N -> KV B H W N D", D=D))
 
