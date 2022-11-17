@@ -638,3 +638,95 @@ class MyopicAttention(nn.Module):
         out = self.out_proj(out)
         return out if not return_attention else (out, attn)
 
+def l2norm(t, groups = 1, dim = -1):
+    if groups == 1:
+        return F.normalize(t, p = 2, dim = dim)
+    t = rearrange(t, '... (g d) -> ... g d', g = groups)
+    t = F.normalize(t, p = 2, dim = dim)
+    return rearrange(t, '... g d -> ... (g d)')
+
+class CosineAttention(nn.Module):
+    def __init__(
+        self,
+        n_feats,
+        head_dim,
+        n_heads,
+        dropout=0.1,
+        bias=False,
+        temperature=15.5,
+        return_attention=False,
+        causal=False,
+        activation='softmax',
+        **kwargs
+    ):
+        super().__init__()
+        assert activation in ['relusq', 'softmax']
+        self.shared_kv = kwargs.get('shared_kv', False)
+        self.talking_heads = kwargs.get('talking_heads', False)
+
+        self.n_feats, self.head_dim, self.n_heads = n_feats, head_dim, n_heads
+        self.dropout = nn.Dropout(dropout)
+        self.bias = bias
+        self.return_attention = return_attention
+        self.causal = causal
+
+        if self.talking_heads:
+            self._head_proj = nn.Conv2d(n_heads, n_heads, (1, 1))
+
+        self.temperature = torch.nn.Parameter(torch.tensor(temperature), requires_grad=True) if isinstance(temperature, float) else temperature
+
+        self.activation = ReLUSquared() if activation == 'relusq' else nn.Softmax(dim=-1)
+
+        if not self.shared_kv:
+            self.qkv_proj = nn.Linear(n_feats, 3 * n_heads * head_dim, bias=bias)
+            self.qkv = lambda x: rearrange(self.qkv_proj(x), "b n (h d qkv) -> qkv b h n d", qkv=3, h=n_heads, d=head_dim)
+        else:
+            self.q_proj, self.kv_proj = [nn.Linear(n_feats, el, bias=bias) for el in [n_heads * head_dim, 2 * head_dim]]
+            map_q, map_kv = lambda q: rearrange(q, 'b n (h d) -> b h n d', h=n_heads), lambda kv: rearrange(kv, 'b n (kv d) -> kv b () n d', kv=2, d=head_dim)
+            self.qkv = lambda x: (map_q(self.q_proj(x)), *map_kv(self.kv_proj(x)))
+
+        self.out_proj = nn.Linear(n_heads * head_dim, n_feats, bias=bias)
+    
+    def head_proj(self, dots):
+        if not self.talking_heads:
+            return dots
+        dots = self._head_proj(dots)
+        return dots      
+
+    def attend(self, query, key, value, mask, pos_fn):
+        query, key = map(l2norm, (query, key))
+
+        dots = einsum('bhid,bhjd->bhij', query, key) * self.temperature
+        dots = self.head_proj(dots)
+
+        dots += pos_fn(dots.shape[-1], device=dots.device, dtype=dots.dtype)
+        qkmask = ~mask
+        attn_mask = ~(rearrange(qkmask, "b n -> b () n ()") * rearrange(qkmask, "b n -> b () () n"))
+    
+        if self.causal: # create a regular causal mask
+            causal_mask = torch.ones(dots.shape[-2], dots.shape[-1], device=dots.device).triu(1).bool()
+            attn_mask = torch.logical_or(attn_mask, causal_mask)
+        
+        dots.masked_fill_(attn_mask, -torch.finfo(dots.dtype).max)
+    
+        attn = self.activation(dots)
+     
+        attn = self.dropout(attn)
+        return einsum("bhij,bhjd->bhid", attn, value)
+
+
+    def forward(self, x, pos_fn, mask=None):
+        assert pos_fn is not None, 'pls provide a position function'
+        B, N, C, H, D = *x.shape, self.n_heads, self.head_dim
+        #print(x.shape, mask.shape)
+       
+        if mask is None:
+            mask = torch.zeros(B, N, device=x.device, dtype=torch.bool)
+
+        q, k, v = self.qkv(x)
+    
+        out = self.attend(q, k, v, mask, pos_fn)
+
+        out = rearrange(out, "b h n d -> b n (h d)")
+        out = self.out_proj(out)
+        return out

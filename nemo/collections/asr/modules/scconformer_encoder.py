@@ -33,6 +33,8 @@ from nemo.core.neural_types import AcousticEncodedRepresentation, LengthsType, N
 
 from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
+from nemo.collections.asr.parts.submodules.dynamic_positions import DynamicPositionBias
+
 
 __all__ = ['SelfConditionedConformerEncoder']
 
@@ -47,11 +49,11 @@ class dummy_positional_encoding(nn.Module):
         '''
         return x, None if not hasattr(self, 'fn') else self.fn
 
-    def store_fn(self, fn, *args, **kwargs):
+    def store_fn(self, fn):
         '''
         Store a function/class
         '''
-        self.fn = fn(*args, **kwargs)
+        self.fn = fn
 
     def extend_pe(self, *args, **kwargs):
         return None
@@ -241,6 +243,18 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
             pos_bias_v = None
             self.pos_enc = dummy_positional_encoding()
             #self.pos_enc.store_fn()
+        elif self_attention_model == "cosine":
+            pos_bias_u = None
+            pos_bias_v = None
+            dynamicpos = DynamicPositionBias(
+                dim = d_model // 4,
+                heads = n_heads,
+                depth = 2,
+                log_distance= False,
+                norm = False
+            )
+            self.pos_enc = dummy_positional_encoding()
+            self.pos_enc.store_fn(dynamicpos)
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 

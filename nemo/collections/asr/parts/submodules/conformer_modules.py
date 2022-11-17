@@ -22,7 +22,8 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
     MultiHeadAttention,
     RelPositionMultiHeadAttention,
     RelPositionSinusoidalGAU,
-    MyopicAttention
+    MyopicAttention,
+    CosineAttention
 )
 
 from nemo.collections.asr.parts.utils.helpers import (
@@ -134,6 +135,18 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 max_keep_keys = max_keep_keys,
                 chunk_window = chunk_window,
             )
+        elif self_attention_model == 'cosine':
+            self.self_attn = CosineAttention(
+                n_feats = d_model,
+                head_dim = max(32, d_model // n_heads),
+                n_heads = n_heads,
+                bias = False,
+                temperature = 15.5,
+                causal = False,
+                shared_kv = True,
+                talking_heads = True,
+                dropout = dropout_att
+            )
         else:
             raise ValueError(
                 f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
@@ -182,6 +195,8 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 x = x if return_attentions is False else (x, weights)
             elif self.self_attention_model == "myopic":
                 x = self.self_attn(x=x, mask=pad_mask, return_attention=return_attentions)
+            elif self.self_attention_model == "cosine":
+                x = self.self_attn(x=x, pos_fn=pos_emb, mask=pad_mask)
             else:
                 x = None
             x, attns = x if return_attentions else (x, None)
