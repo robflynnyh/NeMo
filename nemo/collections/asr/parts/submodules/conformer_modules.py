@@ -75,6 +75,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         qk_dim_divisor=4, # for GAU
         max_keep_keys = 64, # myopic attention
         chunk_window = 8, # myopic attention
+        talking_heads = True # only implemented with cosine attn atm
     ):
         super(ConformerLayer, self).__init__()
 
@@ -144,7 +145,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 temperature = 15.5,
                 causal = False,
                 shared_kv = True,
-                talking_heads = True,
+                talking_heads = talking_heads,
                 dropout = dropout_att
             )
         else:
