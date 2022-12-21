@@ -162,7 +162,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         dropout_emb=0.1,
         dropout_att=0.0,
         checkpoint_every_n_layers=0,
-        talking_heads=True, # only added with cosine sim attn atm..
+        talking_heads='pre', # only added with cosine sim attn atm.. pre or both or post or none
         GAU=False, # https://arxiv.org/pdf/2202.10447.pdf # does not work well currently
         qk_dim_divisor = 4, # for GAU
         max_keep_keys = 64, # myopic attention
