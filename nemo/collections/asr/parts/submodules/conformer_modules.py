@@ -17,6 +17,7 @@ from torch import nn as nn
 from torch.nn import LayerNorm
 
 from torch.nn import functional as F
+from einops import rearrange, repeat
 
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     MultiHeadAttention,
@@ -75,7 +76,8 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         qk_dim_divisor=4, # for GAU
         max_keep_keys = 64, # myopic attention
         chunk_window = 8, # myopic attention
-        talking_heads = 'pre' # only implemented with cosine attn atm 'pre' or 'post' or 'both' or 'none'
+        talking_heads = 'pre', # only implemented with cosine attn atm 'pre' or 'post' or 'both' or 'none'
+        hydra_weighting = False, # https://arxiv.org/pdf/2209.07484.pdf
     ):
         super(ConformerLayer, self).__init__()
 
@@ -98,7 +100,13 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
 
         # convolution module
         self.norm_conv = LayerNorm(d_model)
-        self.conv = ConformerConvolution(d_model=d_model, kernel_size=conv_kernel_size, norm_type=conv_norm_type, weight_standardization=weight_standardization)
+        self.conv = ConformerConvolution(
+            d_model=d_model, 
+            kernel_size=conv_kernel_size, 
+            norm_type=conv_norm_type, 
+            weight_standardization=weight_standardization,
+            hydra_weighting=hydra_weighting
+        )
 
         self.num_memory_vectors = num_memory_vectors
         if self.num_memory_vectors:
@@ -256,6 +264,26 @@ class WSConv1d(nn.Conv1d):
         return F.conv1d(x, weight, self.bias, self.stride,
                         self.padding, self.dilation, self.groups)
 
+class HydraWeighting(nn.Module):
+    '''https://arxiv.org/abs/2209.07484'''
+    def __init__(self, d_model):
+        super(HydraWeighting, self).__init__()
+        self.d_model = d_model
+        self.qkv = nn.Linear(d_model, d_model * 3)
+
+    def forward(self, x):
+        '''
+        x: (B, T, d_model)
+        '''
+        B, N, D = x.shape
+        qkv = self.qkv(x)
+        q,k,v = rearrange(qkv, 'b n d -> b d n ()').chunk(3, dim=1)
+        knorm = k / (k.norm(dim=-2, keepdim=True))
+        qnorm = q / (q.norm(dim=-2, keepdim=True))
+        kv = knorm.transpose(-2,-1).matmul(v)
+        out = qnorm * kv
+        return rearrange(out, 'b d n () -> b n d')
+
 class ConformerConvolution(nn.Module):
     """The convolution module for the Conformer model.
     Args:
@@ -263,10 +291,21 @@ class ConformerConvolution(nn.Module):
         kernel_size (int): kernel size for depthwise convolution
     """
 
-    def __init__(self, d_model, kernel_size, norm_type='batch_norm', weight_standardization=False):
+    def __init__(
+            self, 
+            d_model, 
+            kernel_size, 
+            norm_type='batch_norm', 
+            weight_standardization=False,
+            hydra_weighting=False,
+            ):
+
         super(ConformerConvolution, self).__init__()
         assert (kernel_size - 1) % 2 == 0
         self.d_model = d_model
+        self.hydra_weighting = hydra_weighting
+        if hydra_weighting:
+            self.hydra = HydraWeighting(d_model)
 
         self.pointwise_conv1 = nn.Conv1d(
             in_channels=d_model, out_channels=d_model * 2, kernel_size=1, stride=1, padding=0, bias=True
@@ -299,6 +338,8 @@ class ConformerConvolution(nn.Module):
         )
 
     def forward(self, x, pad_mask=None):
+        if self.hydra_weighting:
+            x = self.hydra(x)
         x = x.transpose(1, 2)
         x = self.pointwise_conv1(x)
         x = nn.functional.glu(x, dim=1)

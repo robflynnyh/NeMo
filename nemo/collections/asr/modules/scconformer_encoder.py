@@ -167,6 +167,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         qk_dim_divisor = 4, # for GAU
         max_keep_keys = 64, # myopic attention
         chunk_window = 8, #
+        hydra_weighting = False, # https://arxiv.org/pdf/2209.07484.pdf
     ):
         super().__init__()
 
@@ -278,7 +279,8 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 qk_dim_divisor=qk_dim_divisor,
                 max_keep_keys=max_keep_keys,
                 chunk_window=chunk_window,
-                talking_heads=talking_heads
+                talking_heads=talking_heads,
+                hydra_weighting=hydra_weighting,
             )
             self.layers.append(layer)
 
