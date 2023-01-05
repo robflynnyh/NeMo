@@ -168,6 +168,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         max_keep_keys = 64, # myopic attention
         chunk_window = 8, #
         hydra_weighting = False, # https://arxiv.org/pdf/2209.07484.pdf
+        spatial_attention_dropout = False, # only imped with cosine sim attn
     ):
         super().__init__()
 
@@ -229,22 +230,25 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 xscale=self.xscale,
                 dropout_rate_emb=dropout_emb,
             )
+
         elif self_attention_model == "abs_pos":
             pos_bias_u = None
             pos_bias_v = None
             self.pos_enc = PositionalEncoding(
                 d_model=d_model, dropout_rate=dropout, max_len=pos_emb_max_len, xscale=self.xscale
             )
+
         elif self_attention_model == "flash":
             pos_bias_u = None
             pos_bias_v = None
             self.pos_enc = dummy_positional_encoding()
             print(f"Using Flash Attention (with rotary positions)\nfrom: https://github.com/HazyResearch/flash-attention")
+
         elif self_attention_model == "myopic":
             pos_bias_u = None
             pos_bias_v = None
             self.pos_enc = dummy_positional_encoding()
-            #self.pos_enc.store_fn()
+            
         elif self_attention_model == "cosine":
             pos_bias_u = None
             pos_bias_v = None
@@ -257,6 +261,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
             )
             self.pos_enc = dummy_positional_encoding()
             self.pos_enc.store_fn(dynamicpos)
+
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
@@ -281,6 +286,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 chunk_window=chunk_window,
                 talking_heads=talking_heads,
                 hydra_weighting=hydra_weighting,
+                spatial_attention_dropout=spatial_attention_dropout, # only imped with cosine sim attn
             )
             self.layers.append(layer)
 

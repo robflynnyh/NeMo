@@ -78,6 +78,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         chunk_window = 8, # myopic attention
         talking_heads = 'pre', # only implemented with cosine attn atm 'pre' or 'post' or 'both' or 'none'
         hydra_weighting = False, # https://arxiv.org/pdf/2209.07484.pdf
+        spatial_attention_dropout = False
     ):
         super(ConformerLayer, self).__init__()
 
@@ -154,7 +155,8 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 causal = False,
                 shared_kv = True,
                 talking_heads = talking_heads,
-                dropout = dropout_att
+                dropout = dropout_att,
+                spatial_attention_dropout = spatial_attention_dropout
             )
         else:
             raise ValueError(

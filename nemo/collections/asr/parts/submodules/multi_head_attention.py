@@ -645,6 +645,27 @@ def l2norm(t, groups = 1, dim = -1):
     t = F.normalize(t, p = 2, dim = dim)
     return rearrange(t, '... g d -> ... (g d)')
 
+class SpatialAttnDropout(nn.Module):
+    def __init__(self, p = 0.25, spatial_size = 5):
+        super().__init__()
+        self.p = p
+        self.spatial_size = spatial_size
+        self.drop = nn.Dropout(p = p)
+
+    def forward(self, x):
+        if not self.training or self.p == 0.:
+            return x
+        if x.shape[-1] // 2 <= self.spatial_size: # normal dropout if sequence is too short
+            return self.drop(x)
+        B,H,I,J = x.shape
+        dropmask = torch.ones((B,H,I,J//self.spatial_size), device = x.device, dtype = torch.half if x.device.type == 'cuda' else x.dtype)
+        dropmask = self.drop(dropmask)
+        dropmask = dropmask.repeat_interleave(self.spatial_size, dim = -1)
+        # pad the end of the mask to match the length of the input (with dropmask.max() (bcos of scale up from dropout))
+        dropmask = torch.nn.functional.pad(dropmask, (0, J - dropmask.shape[-1]), value=dropmask.max())
+        return x * dropmask
+        
+
 class CosineAttention(nn.Module):
     def __init__(
         self,
@@ -663,9 +684,13 @@ class CosineAttention(nn.Module):
         assert activation in ['relusq', 'softmax']
         self.shared_kv = kwargs.get('shared_kv', False)
         self.talking_heads = kwargs.get('talking_heads', 'pre')
+        spatial_attn_dropout = kwargs.get('spatial_attn_dropout', False)
 
         self.n_feats, self.head_dim, self.n_heads = n_feats, head_dim, n_heads
-        self.dropout = nn.Dropout(dropout)
+        if not spatial_attn_dropout:
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.dropout = SpatialAttnDropout(p = dropout)
         self.bias = bias
         self.return_attention = return_attention
         self.causal = causal
