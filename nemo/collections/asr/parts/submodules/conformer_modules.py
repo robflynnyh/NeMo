@@ -59,6 +59,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
 
     def __init__(
         self,
+        layer_idx,
         d_model,
         d_ff,
         self_attention_model='rel_pos',
@@ -78,7 +79,8 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         chunk_window = 8, # myopic attention
         talking_heads = 'pre', # only implemented with cosine attn atm 'pre' or 'post' or 'both' or 'none'
         hydra_weighting = False, # https://arxiv.org/pdf/2209.07484.pdf
-        spatial_attention_dropout = False
+        spatial_attention_dropout = False,
+        bottleneck_initial_ff = False
     ):
         super(ConformerLayer, self).__init__()
 
@@ -92,12 +94,19 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         self.n_heads = n_heads
         self.fc_factor = 0.5
 
+        self.hydra_weighting = hydra_weighting
+        self.layer_idx = layer_idx
         self.sparse_topk = sparse_topk
 
         if isfalse(GAU):
             # first feed forward module
             self.norm_feed_forward1 = LayerNorm(d_model)
-            self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+            ff1_d_ff = d_ff
+            ff1_d0 = dropout
+            if bottleneck_initial_ff:
+                ff1_d_ff = d_model // 2
+                ff1_d0 = 0.0
+            self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=ff1_d_ff, dropout=ff1_d0)
 
         # convolution module
         self.norm_conv = LayerNorm(d_model)
@@ -105,8 +114,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             d_model=d_model, 
             kernel_size=conv_kernel_size, 
             norm_type=conv_norm_type, 
-            weight_standardization=weight_standardization,
-            hydra_weighting=hydra_weighting
+            weight_standardization=weight_standardization
         )
 
         self.num_memory_vectors = num_memory_vectors
@@ -146,18 +154,21 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 chunk_window = chunk_window,
             )
         elif self_attention_model == 'cosine':
-            self.self_attn = CosineAttention(
-                n_feats = d_model,
-                head_dim = max(32, d_model // n_heads),
-                n_heads = n_heads,
-                bias = False,
-                temperature = 15.5,
-                causal = False,
-                shared_kv = True,
-                talking_heads = talking_heads,
-                dropout = dropout_att,
-                spatial_attention_dropout = spatial_attention_dropout
-            )
+            if hydra_weighting == False or layer_idx <= 4:
+                self.self_attn = CosineAttention(
+                    n_feats = d_model,
+                    head_dim = max(32, d_model // n_heads),
+                    n_heads = n_heads,
+                    bias = False,
+                    temperature = 15.5,
+                    causal = False,
+                    shared_kv = True,
+                    talking_heads = talking_heads,
+                    dropout = dropout_att,
+                    spatial_attention_dropout = spatial_attention_dropout
+                )
+            else:
+                self.self_attn = HydraAttention(d_model=d_model)
         else:
             raise ValueError(
                 f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
@@ -207,7 +218,10 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             elif self.self_attention_model == "myopic":
                 x = self.self_attn(x=x, mask=pad_mask, return_attention=return_attentions)
             elif self.self_attention_model == "cosine":
-                x = self.self_attn(x=x, pos_fn=pos_emb, mask=pad_mask)
+                if self.hydra_weighting == False or self.layer_idx <= 4:
+                    x = self.self_attn(x=x, pos_fn=pos_emb, mask=pad_mask)
+                else:
+                    x = self.self_attn(x=x)
             else:
                 x = None
             x, attns = x if return_attentions else (x, None)
@@ -266,25 +280,68 @@ class WSConv1d(nn.Conv1d):
         return F.conv1d(x, weight, self.bias, self.stride,
                         self.padding, self.dilation, self.groups)
 
-class HydraWeighting(nn.Module):
-    '''https://arxiv.org/abs/2209.07484'''
-    def __init__(self, d_model):
-        super(HydraWeighting, self).__init__()
+class TwoWayHydraAttention(nn.Module):
+    def __init__(self, d_model, heads=1):
+        super(TwoWayHydraAttention, self).__init__()
         self.d_model = d_model
-        self.qkv = nn.Linear(d_model, d_model * 3)
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.kv = nn.Linear(d_model, d_model * 2, bias=False)
+        self.per_dim_scaler = nn.Parameter(torch.ones(1,1,d_model), requires_grad=True)
+        self.per_dim_bias = nn.Parameter(torch.zeros(1,1,d_model), requires_grad=True)
+        self.out = nn.Linear(d_model, d_model, bias=False)
+        self.heads = heads
 
-    def forward(self, x):
-        '''
-        x: (B, T, d_model)
-        '''
-        B, N, D = x.shape
-        qkv = self.qkv(x)
-        q,k,v = rearrange(qkv, 'b n d -> b d n ()').chunk(3, dim=1)
+    def forward(self, x, mask=None):
+        '''x: (B, T, D)'''
+        h = self.heads
+        kv = self.kv(x)
+        k, v = rearrange(kv, 'b n (h d) -> b n h d ()', h=h).chunk(2, dim=-2)
+        knormD = k / (k.norm(dim=-2, keepdim=True))
+        xnorm = x / (x.norm(dim=-1, keepdim=True))
+     
+        kv = knormD.transpose(-2,-1).matmul(v)
+        xnorm = rearrange(xnorm, 'b n d -> b n () d ()')
+        xnormW = (xnorm * kv).sum(dim=2).squeeze()
+
+        xnormW = xnormW * self.per_dim_scaler + self.per_dim_bias
+        if mask is not None:
+            mask = rearrange(mask, 'b n -> b n ()')
+            xnormW = xnormW.masked_fill(mask, 0)
+
+        q, kv = self.q(xnormW), self.kv(xnormW)
+        remap = lambda x: rearrange(x, 'b n d -> b d n ()')
+        q, kv = map(remap, (q, kv))
+        k, v = kv.chunk(2, dim=1)
         knorm = k / (k.norm(dim=-2, keepdim=True))
         qnorm = q / (q.norm(dim=-2, keepdim=True))
         kv = knorm.transpose(-2,-1).matmul(v)
         out = qnorm * kv
-        return rearrange(out, 'b d n () -> b n d')
+        out = rearrange(out, 'b d n () -> b n d')
+        out = self.out(out) 
+        return out
+
+
+class HydraAttention(nn.Module):
+    def __init__(self, d_model, output_layer='linear'):
+        '''
+        output_layer: 'linear' | 'none'
+        '''
+        super(HydraAttention, self).__init__()
+        self.d_model = d_model
+        self.qkv = nn.Linear(d_model, d_model * 3)
+        if output_layer == 'linear':
+            self.out = nn.Linear(d_model, d_model)
+        elif output_layer == 'none':
+            self.out = nn.Identity()
+
+    def forward(self, x):
+        '''x: (B, T, D)'''
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q / q.norm(dim=-1, keepdim=True)
+        k = k / k.norm(dim=-1, keepdim=True)
+        kv = (k * v).sum(dim=-2, keepdim=True)
+        out = q * kv
+        return self.out(out)
 
 class ConformerConvolution(nn.Module):
     """The convolution module for the Conformer model.
@@ -299,15 +356,12 @@ class ConformerConvolution(nn.Module):
             kernel_size, 
             norm_type='batch_norm', 
             weight_standardization=False,
-            hydra_weighting=False,
             ):
 
         super(ConformerConvolution, self).__init__()
         assert (kernel_size - 1) % 2 == 0
         self.d_model = d_model
-        self.hydra_weighting = hydra_weighting
-        if hydra_weighting:
-            self.hydra = HydraWeighting(d_model)
+     
 
         self.pointwise_conv1 = nn.Conv1d(
             in_channels=d_model, out_channels=d_model * 2, kernel_size=1, stride=1, padding=0, bias=True
@@ -340,8 +394,7 @@ class ConformerConvolution(nn.Module):
         )
 
     def forward(self, x, pad_mask=None):
-        if self.hydra_weighting:
-            x = self.hydra(x)
+  
         x = x.transpose(1, 2)
         x = self.pointwise_conv1(x)
         x = nn.functional.glu(x, dim=1)

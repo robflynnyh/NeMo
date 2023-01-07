@@ -169,6 +169,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         chunk_window = 8, #
         hydra_weighting = False, # https://arxiv.org/pdf/2209.07484.pdf
         spatial_attention_dropout = False, # only imped with cosine sim attn
+        bottleneck_initial_ff = False
     ):
         super().__init__()
 
@@ -268,6 +269,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             layer = ConformerLayer(
+                layer_idx = n_layers - i,
                 d_model=d_model,
                 d_ff=d_ff,
                 self_attention_model=self_attention_model,
@@ -287,6 +289,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 talking_heads=talking_heads,
                 hydra_weighting=hydra_weighting,
                 spatial_attention_dropout=spatial_attention_dropout, # only imped with cosine sim attn
+                bottleneck_initial_ff = bottleneck_initial_ff,
             )
             self.layers.append(layer)
 
