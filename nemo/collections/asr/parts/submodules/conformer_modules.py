@@ -154,7 +154,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 chunk_window = chunk_window,
             )
         elif self_attention_model == 'cosine':
-            if hydra_weighting == False or layer_idx <= 4:
+            if hydra_weighting == False or layer_idx <= 5:
                 self.self_attn = CosineAttention(
                     n_feats = d_model,
                     head_dim = max(32, d_model // n_heads),
@@ -218,10 +218,10 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             elif self.self_attention_model == "myopic":
                 x = self.self_attn(x=x, mask=pad_mask, return_attention=return_attentions)
             elif self.self_attention_model == "cosine":
-                if self.hydra_weighting == False or self.layer_idx <= 4:
+                if self.hydra_weighting == False or self.layer_idx <= 5:
                     x = self.self_attn(x=x, pos_fn=pos_emb, mask=pad_mask)
                 else:
-                    x = self.self_attn(x=x)
+                    x = self.self_attn(x=x, mask=pad_mask)
             else:
                 x = None
             x, attns = x if return_attentions else (x, None)
@@ -322,25 +322,24 @@ class TwoWayHydraAttention(nn.Module):
 
 
 class HydraAttention(nn.Module):
-    def __init__(self, d_model, output_layer='linear'):
-        '''
-        output_layer: 'linear' | 'none'
-        '''
+    def __init__(self, d_model, output_layer='linear', dropout=0.0):
         super(HydraAttention, self).__init__()
         self.d_model = d_model
         self.qkv = nn.Linear(d_model, d_model * 3)
-        if output_layer == 'linear':
-            self.out = nn.Linear(d_model, d_model)
-        elif output_layer == 'none':
-            self.out = nn.Identity()
+        self.out = nn.Linear(d_model, d_model) if output_layer == 'linear' else nn.Identity()
+        self.dropout = nn.Dropout(dropout) 
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         '''x: (B, T, D)'''
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q / q.norm(dim=-1, keepdim=True)
         k = k / k.norm(dim=-1, keepdim=True)
-        kv = (k * v).sum(dim=-2, keepdim=True)
-        out = q * kv
+        if mask is not None:
+            k, v = k.masked_fill(mask.unsqueeze(-1), 0), v.masked_fill(mask.unsqueeze(-1), 0)
+        kvw = (k * v)
+        if self.dropout.p > 0:
+            kvw = self.dropout(kvw.transpose(-1, -2)).transpose(-1, -2) # dropout in seq dimension 
+        out = kvw.sum(dim=-2, keepdim=True) * q
         return self.out(out)
 
 class ConformerConvolution(nn.Module):
