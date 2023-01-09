@@ -43,25 +43,6 @@ class StackingSubsampling(torch.nn.Module):
         return x, lengths
 
 
-class HydraWeighting(nn.Module):
-    '''https://arxiv.org/abs/2209.07484'''
-    def __init__(self, d_model):
-        super(HydraWeighting, self).__init__()
-        self.d_model = d_model
-        self.qkv = nn.Linear(d_model, d_model * 3)
-
-    def forward(self, x):
-        '''
-        x: (B, T, d_model)
-        '''
-        B, N, D = x.shape
-        qkv = self.qkv(x)
-        q,k,v = rearrange(qkv, 'b n d -> b d n ()').chunk(3, dim=1)
-        knorm = k / (k.norm(dim=-2, keepdim=True))
-        qnorm = q / (q.norm(dim=-2, keepdim=True))
-        kv = knorm.transpose(-2,-1).matmul(v)
-        out = qnorm * kv
-        return rearrange(out, 'b d n () -> b n d')
 
 class ConvSubsampling(torch.nn.Module):
     """Convolutional subsampling which supports VGGNet and striding approach introduced in:

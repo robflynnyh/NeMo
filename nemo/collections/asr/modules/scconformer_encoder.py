@@ -269,7 +269,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             layer = ConformerLayer(
-                layer_idx = n_layers - i,
+                layer_idx = i,
                 d_model=d_model,
                 d_ff=d_ff,
                 self_attention_model=self_attention_model,

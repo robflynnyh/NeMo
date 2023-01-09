@@ -1,4 +1,4 @@
-import torch, torch.nn as nn
+import torch, torch.nn as nn, torch.nn.functional as F
 
 from nemo.collections.asr.parts.submodules.dynamic_positions import DynamicPositionBiasXL
 from nemo.collections.asr.parts.submodules.conformer_modules import (
@@ -14,7 +14,6 @@ from nemo.core.classes.module import NeuralModule
 from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling
 
 from torch.utils.checkpoint import checkpoint # # gradient/activation checkpointing
-
 
 from einops import rearrange, repeat
 from torch import einsum
@@ -35,7 +34,6 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
         checkpoint_every_n_layers = 1,
         subsampling_factor = 4,
         conv_kernel_size = 31,
-        cached_kv_vector = True,
         **kwargs
     ):
         super().__init__()
@@ -61,8 +59,8 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
             subsampling_factor = subsampling_factor,
             feat_in = feat_in,
             feat_out = d_model,
-            subsampling_conv_channels = d_model,
-            activation = nn.ReLu(),
+            conv_channels = d_model,
+            activation = nn.ReLU()
         )
 
         self.layers = nn.ModuleList()
@@ -76,6 +74,9 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
                 dropout_attn = dropout_attn,
                 layer_idx = i,
                 total_layers = n_layers,
+                head_dim = head_dim,
+                n_heads = n_heads,
+                **kwargs
             )
             self.layers.append(l)
 
@@ -98,27 +99,34 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
     def forward_for_export(self, audio_signal, decoder, length = None, cached_kvs = None, cached_kv_lengths = None):
         max_audio_length: int = audio_signal.size(-1)
         pos_emb = self.position_bias
-
+        
         if length is None:
             length = audio_signal.new_full(
                 audio_signal.size(0), max_audio_length, dtype=torch.int32, device=self.seq_range.device
             )
-
+            
         audio_signal = torch.transpose(audio_signal, 1, 2)
-        audio_signal = self.subsampling(audio_signal)
+        audio_signal, length = self.subsampling(audio_signal, lengths = length)
+        max_audio_length = audio_signal.size(1)
 
-        # temporary (todo)
-        cached_kv_indices = cached_kv_lengths
-        # temporary (todo)
+        ## create masks
+        mask = torch.arange(max_audio_length, device=audio_signal.device).expand(audio_signal.size(0), max_audio_length) >= length.unsqueeze(1)
+        cached_kv_lengths = cached_kv_lengths if cached_kv_lengths is not None else 0
+      
+        full_kv_lengths = length + cached_kv_lengths
+        full_kv_mask = torch.arange(full_kv_lengths.max(), device=audio_signal.device).expand(audio_signal.size(0), full_kv_lengths.max()) >= full_kv_lengths.unsqueeze(1)
+        qmask, kmask = ~mask, ~full_kv_mask
+        att_mask = ~(rearrange(qmask, 'b n -> b () n ()') * rearrange(kmask, 'b n -> b () () n'))
+        pad_mask = mask
+        #print(pad_mask.shape, att_mask.shape)
+        #print(full_kv_lengths.max())
+        
+        ###
 
-        # temporary (todo)
-        mask = self.make_pad_mask(max_audio_length, length)
-        pad_mask = self.make_pad_mask(max_audio_length, length)
-        att_mask = pad_mask.unsqueeze(1).repeat([1, max_audio_length, 1]) 
-        att_mask = torch.logical_and(att_mask, att_mask.transpose(1, 2))
-        att_mask = ~att_mask
-        pad_mask = ~pad_mask
-        # temporary (todo)
+        cached_kv_indices = None
+        if cached_kvs is not None and cached_kv_lengths is not None:
+            cached_kv_indices = self.get_cache_indices(x_lens=length, cache_lens=cached_kv_lengths, cache_kv=cached_kvs, x=audio_signal)
+
 
         iterim_posteriors = []
         kvs_to_cache = []
@@ -130,7 +138,8 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
                     att_mask, # att_mask
                     pos_emb, # pos_emb
                     pad_mask, # pad_mask
-                    cached_kvs[lth] if cached_kvs is not None else None, # cached_kv
+                    cached_kvs[:,:,lth] if cached_kvs is not None else None, # cached_kv
+                    cached_kv_indices # cached_kv_indices
                 )
             else:
                 audio_signal, kv_to_cache = layer(
@@ -138,7 +147,8 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
                     att_mask = att_mask, 
                     pos_emb = pos_emb, 
                     pad_mask = pad_mask,
-                    cached_kv = cached_kvs[lth] if cached_kvs is not None else None,
+                    cached_kv = cached_kvs[:,:,lth] if cached_kvs is not None else None,
+                    cached_kv_indices = cached_kv_indices
                 )
 
             kvs_to_cache.append(kv_to_cache) # possibly detach and move to cpu ?    
@@ -148,24 +158,41 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
                 iterim_post = torch.nn.functional.softmax(iterim_logits, dim=-1)
                 iterim_logposteriors = torch.log(iterim_post)
                 iterim_posteriors.append(iterim_logposteriors)
-                if self.self_condition == True:
-                    audio_signal = decoder.integrate_projections(audio_signal, decoder.project_back(iterim_post))        
+                audio_signal = decoder.integrate_projections(audio_signal, decoder.project_back(iterim_post))        
 
         audio_signal = torch.transpose(audio_signal, 1, 2) # (batch, seq_len, d_model) -> (batch, d_model, seq_len) 
 
         # stack the posteriors along the first dimension (height, batch, seq_len, dim)
         iterim_posteriors = torch.stack(iterim_posteriors, dim=0)
         kvs_to_cache = torch.stack(kvs_to_cache, dim=0)
+        kvs_to_cache = rearrange(kvs_to_cache, 'l kv b h n d -> kv b l h n d')
         
-        return audio_signal, iterim_posteriors, kvs_to_cache, length
+        return audio_signal, iterim_posteriors, kvs_to_cache, length, full_kv_lengths
 
-    def make_pad_mask(self, max_audio_length, seq_lens):
-        """Make masking for padding."""
-        mask = self.seq_range[:max_audio_length].expand(seq_lens.size(0), -1) < seq_lens.unsqueeze(-1)
-        return mask
+        
+    @staticmethod
+    def get_cache_indices(x_lens, cache_lens, cache_kv, x):
+        max_new_len = (x_lens + cache_lens).max()
 
+        B, H, N, D = x.shape[0], 1, (x.shape[1] + cache_kv.shape[-2]), cache_kv.shape[-1]
 
-class PreNorm(nn.Module):
+        indices = []
+        for i in range(B):
+            cache_indices = torch.arange(cache_lens[i], device='cpu')
+            total_length = cache_lens[i] + x_lens[i]
+            diff_from_max_len = max_new_len - total_length
+            x_indices = torch.arange(x_lens[i]+diff_from_max_len, device='cpu') + cache_kv.shape[-2]
+            if diff_from_max_len > 0:
+                x_indices[-diff_from_max_len:] = N - 1 # -1 is the padding index
+            new_indices = torch.cat([cache_indices, x_indices])
+            indices.append(new_indices)
+
+        indices = torch.stack(indices, dim=0)
+
+        indices = rearrange(indices, 'b n -> () b () n ()').expand(2,B,H,-1,D)
+        return indices.to(x.device)
+
+class PreNorm(nn.Module): # applies normalization before fn
     def __init__(self, d_model, fn):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
@@ -173,6 +200,15 @@ class PreNorm(nn.Module):
 
     def forward(self, x, **kwargs):
         return self.fn(self.norm(x), **kwargs)
+
+class Scale(nn.Module): # scales output of fn by scale
+    def __init__(self, scale, fn):
+        super().__init__()
+        self.scale = scale
+        self.fn = fn
+    
+    def forward(self, x, **kwargs):
+        return self.fn(x, **kwargs) * self.scale
 
 class ConformerLayer(nn.Module):
     def __init__(
@@ -185,16 +221,18 @@ class ConformerLayer(nn.Module):
         dropout_attn,
         layer_idx,
         total_layers,
+        head_dim,
+        n_heads,
+        **kwargs
     ):
         super().__init__()
 
         self.d_model = d_model
         self.conv_kernel_size = conv_kernel_size
         self.layer_idx = layer_idx
+        self.total_layers = total_layers
 
         d_ff = d_model * expansion_factor
-
-        self.fc_factor = 0.5 # conformer multiplies ff output by 0.5 
 
         self.conv = PreNorm(d_model = d_model, fn = ConformerConvolution(
             d_model = d_model,
@@ -205,16 +243,27 @@ class ConformerLayer(nn.Module):
         self.do_conv = nn.Dropout(dropout_conv)
 
         ff_args = {'d_model': d_model, 'd_ff': d_ff, 'dropout': dropout_ff}
-        self.ff1 = PreNorm(d_model = d_model, fn = ConformerFeedForward(**ff_args))
-        self.ff2 = PreNorm(d_model = d_model, fn = ConformerFeedForward(**ff_args))
+        self.ff1 = Scale(0.5, PreNorm(d_model = d_model, fn = ConformerFeedForward(**ff_args)))
+        self.ff2 = Scale(0.5, PreNorm(d_model = d_model, fn = ConformerFeedForward(**ff_args)))
         self.do_ff = nn.Dropout(dropout_ff)
 
-        self.attend = nn.Identity() # todo
-        self.do_attn_out = nn.Dropout(0.1) # espnet and nemo do this but idk see this usually will keep it as a constant
+        self.attend = PreNorm(d_model = d_model, fn = CosineAttention(
+            n_feats = d_model,
+            head_dim = head_dim,
+            n_heads = n_heads,
+            dropout = dropout_attn,
+            bias = False,
+            temperature = kwargs.get('temperature', 15.5),
+            activation = 'softmax'
+        ))
+
+        self.do_attn_out = nn.Dropout(min(dropout_ff, 0.1)) # don't wan't this too large
 
         self.norm_out = nn.LayerNorm(d_model)
 
-    def forward(self, x, pos_emb, pad_mask, attn_mask, cached_kv = None, cached_kv_indices = None):
+            
+
+    def forward(self, x, attn_mask, pos_emb, pad_mask, cached_kv = None, cached_kv_indices = None):
         '''
         pad_mask: mask for padding used in conv layers
         attn_mask: attn_mask this should include the cached keys and values
@@ -223,19 +272,21 @@ class ConformerLayer(nn.Module):
             these only need to be calculated once hence they are passed to each layer
         '''
 
-        x = self.do_ff(self.ff1(x)) * self.fc_factor + x
+        x = self.do_ff(self.ff1(x)) + x
 
-        attn_out, kv_to_cache = self.do_attn_out(self.attend(
+        attn_out, kv_to_cache = self.attend(
             x = x,
-            pos_emb = pos_emb,
+            pos_fn = pos_emb,
             attn_mask = attn_mask,
             cached_kv = cached_kv,
             cached_kv_indices = cached_kv_indices
-        ))
-        x = attn_out + x
+        )
+        x = self.do_attn_out(attn_out) + x
 
-        x = self.do_conv(self.conv(x, pad_mask)) + x
-        x = self.do_ff(self.ff2(x)) * self.fc_factor + x
+        
+        x = self.do_conv(self.conv(x, pad_mask = pad_mask)) + x
+
+        x = self.do_ff(self.ff2(x)) + x
 
         x = self.norm_out(x)
 
@@ -278,23 +329,17 @@ class CosineAttention(nn.Module):
         dropout=0.1,
         bias=False,
         temperature=15.5,
-        return_attention=False,
         activation='softmax',
         **kwargs
     ):
         super().__init__()
         assert activation in ['relusq', 'softmax']
-        self.shared_kv = kwargs.get('shared_kv', False)
+        self.shared_kv = kwargs.get('shared_kv', True)
         self.talking_heads = kwargs.get('talking_heads', 'pre')
         spatial_attn_dropout = kwargs.get('spatial_attn_dropout', False)
 
         self.n_feats, self.head_dim, self.n_heads = n_feats, head_dim, n_heads
-        if not spatial_attn_dropout:
-            self.dropout = nn.Dropout(dropout)
-        else:
-            self.dropout = SpatialAttnDropout(p = dropout)
-        self.bias = bias
-        self.return_attention = return_attention
+        self.dropout = nn.Dropout(dropout) if not spatial_attn_dropout else SpatialAttnDropout(p = dropout)
         
         if self.talking_heads:
             if self.talking_heads == 'pre' or self.talking_heads == 'both':
@@ -327,7 +372,7 @@ class CosineAttention(nn.Module):
     def attend(self, query, key, value, attn_mask, pos_fn):
         dots = einsum('bhid,bhjd->bhij', query, key) * self.temperature
         dots = self.head_proj(dots, mode='pre')
-
+        #print(dots.shape)
         dots += pos_fn(i=dots.shape[-2], j=dots.shape[-1], device=dots.device, dtype=dots.dtype)
         
         dots.masked_fill_(attn_mask, -torch.finfo(dots.dtype).max)
@@ -340,11 +385,16 @@ class CosineAttention(nn.Module):
 
     @staticmethod
     def attatch_cache(kv, cached_kv, cached_kv_indices):
-        kv = torch.stack([kv[0], kv[1]], dim=0)
+        kv = torch.stack(kv, dim=0)
         if cached_kv is None or cached_kv_indices is None:
             return kv
-        new_kv = torch.cat([cached_kv, kv], dim=-2)
+        # zero vector for padding in the gather
+        # kv is shape [2, B, H, N, D] so zero vector is [2, B, H, 1, D]
+        zero_vector = torch.zeros_like(kv[:, :, :, :1, :])
+        #print(zero_vector.shape, cached_kv.shape, kv.shape)
+        new_kv = torch.cat([cached_kv, kv, zero_vector], dim=-2)
         new_kv = torch.gather(new_kv, dim=-2, index=cached_kv_indices)
+      
         return new_kv
 
     def forward(self, x, pos_fn, attn_mask, cached_kv=None, cached_kv_indices=None):
@@ -354,7 +404,7 @@ class CosineAttention(nn.Module):
        
         q, k, v = self.qkv(x)
         q, k = map(l2norm, (q, k))
-        kv = self.attatch_cache((k, v), cached_kv, cached_kv_indices)
+        kv = self.attatch_cache([k, v], cached_kv, cached_kv_indices)
         k, v = kv
 
         out = self.attend(q, k, v, attn_mask, pos_fn)

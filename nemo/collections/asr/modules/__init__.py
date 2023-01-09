@@ -38,6 +38,8 @@ from nemo.collections.asr.modules.conformer_encoder_grouped_attention import Gro
 
 from nemo.collections.asr.modules.scconformer_encoder_BERT import SelfConditionedConformerEncoder as SelfConditionedConformerEncoderBERT
 
+from nemo.collections.asr.modules.sconformer_xl import SelfConditionedConformerXL
+
 from nemo.collections.asr.modules.conv_asr import (
     ConvASRDecoder,
     ConvASRSelfConditioningDecoder,
