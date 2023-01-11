@@ -563,9 +563,13 @@ class RNNEncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         encoder_args = {k: v for k, v in encoder_args.items() if v is not None}
 
         encoder_out = self.encoder(**encoder_args)
-        encoded, iterim_posteriors, kvs_to_cache ,encoded_len, full_kv_lens = encoder_out
+        encoded, iterim_posteriors, kvs_to_cache ,encoded_len, full_kv_lens, other = encoder_out
 
-        additional_outputs = {'kvs_to_cache': kvs_to_cache, 'full_kv_lens': full_kv_lens}
+        additional_outputs = {
+            'kvs_to_cache': kvs_to_cache, 
+            'full_kv_lens': full_kv_lens,
+            'commit_loss': other['commit_loss'],
+        }
 
         log_probs = self.decoder(encoder_output=encoded, logits=False)
         

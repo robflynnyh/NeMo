@@ -17,6 +17,7 @@ from torch.utils.checkpoint import checkpoint # # gradient/activation checkpoint
 
 from einops import rearrange, repeat
 from torch import einsum
+from vector_quantize_pytorch import VectorQuantize
 
 
 class SelfConditionedConformerXL(NeuralModule, Exportable):
@@ -53,6 +54,14 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
         self.dropout_attn = dropout_attn
 
         self.position_bias = DynamicPositionBiasXL(heads = n_heads, **DynamicPositionBiasXL.fetch_module_kwargs(kwargs))
+
+        self.VQ = VectorQuantize(
+            dim = head_dim,
+            codebook_size = 256,
+            use_cosine_sim = True,
+            commitment_weight = 0.25,
+            codebook_dim = head_dim // 2,
+        )
 
         self.subsampling = ConvSubsampling(
             subsampling = 'striding',
@@ -111,24 +120,24 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
 
         ## create masks
         mask = torch.arange(max_audio_length, device=audio_signal.device).expand(audio_signal.size(0), max_audio_length) >= length.unsqueeze(1)
-        cached_kv_lengths = cached_kv_lengths if cached_kv_lengths is not None else 0
+        cached_kv_lengths = cached_kv_lengths if cached_kv_lengths is not None else None
+        cached_kv_pad_mask = None
+        if cached_kv_lengths != None:
+            cached_kv_pad_mask = torch.arange(cached_kvs.shape[-2], device=audio_signal.device).expand(audio_signal.size(0), cached_kvs.shape[-2]) >= cached_kv_lengths.unsqueeze(1)
       
-        full_kv_lengths = length + cached_kv_lengths
+        full_kv_lengths = length + cached_kv_lengths if cached_kv_lengths is not None else length
         full_kv_mask = torch.arange(full_kv_lengths.max(), device=audio_signal.device).expand(audio_signal.size(0), full_kv_lengths.max()) >= full_kv_lengths.unsqueeze(1)
         qmask, kmask = ~mask, ~full_kv_mask
         att_mask = ~(rearrange(qmask, 'b n -> b () n ()') * rearrange(kmask, 'b n -> b () () n'))
         pad_mask = mask
-        #print(pad_mask.shape, att_mask.shape)
-        #print(full_kv_lengths.max())
-        
-        ###
 
         cached_kv_indices = None
-        if cached_kvs is not None and cached_kv_lengths is not None:
+        if cached_kvs is not None and cached_kv_lengths != None:
             cached_kv_indices = self.get_cache_indices(x_lens=length, cache_lens=cached_kv_lengths, cache_kv=cached_kvs, x=audio_signal)
 
 
         iterim_posteriors = []
+        commit_losses = []
         kvs_to_cache = []
         for lth, layer in enumerate(self.layers):
             # cached kvs for the layer up
@@ -136,7 +145,10 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
             current_layer_kvs = cached_kvs[:,:,lth] if cached_kvs is not None else None
             layer_up_kvs = current_layer_kvs if layer_up_kvs is None else layer_up_kvs
             cached_kvs_to_pass = None
+
             if current_layer_kvs is not None:
+                layer_up_kvs, commit_loss = self.vector_quantize_cached_states(layer_up_kvs, pad_mask=cached_kv_pad_mask, device=audio_signal.device, dtype=audio_signal.dtype)
+                commit_losses.append(commit_loss)
                 cached_kvs_to_pass = torch.stack([current_layer_kvs, layer_up_kvs], dim=0)
 
 
@@ -176,11 +188,23 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
         kvs_to_cache = torch.stack(kvs_to_cache, dim=0)
         kvs_to_cache = rearrange(kvs_to_cache, 'l kv b h n d -> kv b l h n d')
         
-        return audio_signal, iterim_posteriors, kvs_to_cache, length, full_kv_lengths
+        commit_losses = torch.stack(commit_losses, dim=0).sum() if len(commit_losses) > 0 else 0
+        
+        return audio_signal, iterim_posteriors, kvs_to_cache, length, full_kv_lengths, {'commit_loss': commit_losses}
 
+    def vector_quantize_cached_states(self, cached_kv, pad_mask, device, dtype):
+        KV, B, H, N, D = cached_kv.shape
+        cached_kv = cached_kv.to(device=device, dtype=dtype)
+        cached_kv = rearrange(cached_kv, 'kv b h n d -> (kv b h) n d')
+        pad_mask = repeat(pad_mask, 'b n -> (kv b h) n', kv=KV, b=B, h=H)
+        vq_cached_kv, indices, commit_loss = self.VQ(cached_kv, mask=~pad_mask)
+   
+        vq_cached_kv = rearrange(vq_cached_kv, '(kv b h) n d -> kv b h n d', kv=KV, b=B, h=H, n=N, d=D)
+        return vq_cached_kv, commit_loss
         
     @staticmethod
-    def get_cache_indices(x_lens, cache_lens, cache_kv, x):
+    def get_cache_indices(x_lens, cache_lens, cache_kv, x): 
+        # used later w/ gather to remove padding when cache is concatenated with current input
         max_new_len = (x_lens + cache_lens).max()
 
         B, H, N, D = x.shape[0], 1, (x.shape[1] + cache_kv.shape[-2]), cache_kv.shape[-1]
@@ -310,7 +334,7 @@ def l2norm(t, groups = 1, dim = -1):
     t = F.normalize(t, p = 2, dim = dim)
     return rearrange(t, '... g d -> ... (g d)')
 
-class SpatialAttnDropout(nn.Module): # this is a inefficient way to do this. todo
+class SpatialAttnDropout(nn.Module): # this is a inefficient way to do this. todo (could use normal d0 and group dimensions?)
     def __init__(self, p = 0.25, spatial_size = 5):
         super().__init__()
         self.p = p
@@ -349,7 +373,7 @@ class CosineAttention(nn.Module):
         spatial_attn_dropout = kwargs.get('spatial_attn_dropout', False)
         self.layer_idx = kwargs.get('layer_idx', None)
 
-        self.history_vector = torch.nn.Parameter(torch.zeros(2, 1, 1, 1, head_dim), requires_grad=True)
+        #self.history_vector = torch.nn.Parameter(torch.zeros(2, 1, 1, 1, head_dim), requires_grad=True)
 
         self.n_feats, self.head_dim, self.n_heads = n_feats, head_dim, n_heads
         self.dropout = nn.Dropout(dropout) if not spatial_attn_dropout else SpatialAttnDropout(p = dropout)
@@ -386,7 +410,9 @@ class CosineAttention(nn.Module):
         dots = einsum('bhid,bhjd->bhij', query, key) * self.temperature
         dots = self.head_proj(dots, mode='pre')
         #print(dots.shape)
-        dots += pos_fn(i=dots.shape[-2], j=dots.shape[-1], device=dots.device, dtype=dots.dtype)
+        pos = pos_fn(i=dots.shape[-2], j=dots.shape[-1], device=dots.device, dtype=dots.dtype)
+
+        #dots += pos
         
         dots.masked_fill_(attn_mask, -torch.finfo(dots.dtype).max)
 
@@ -410,15 +436,12 @@ class CosineAttention(nn.Module):
         kv = torch.stack(kv, dim=0)
         if cached_kv is None or cached_kv_indices is None:
             return kv, kv
-        # zero vector for padding in the gather
-        # kv is shape [2, B, H, N, D] so zero vector is [2, B, H, 1, D]
-        # add extra dimension for kvs from different layers
-        kv = kv.unsqueeze(0).expand(2, *kv.shape)
-        zero_vector = torch.zeros_like(kv[:, :, :, :, :1, :])
-   
-        cached_kv[1] += self.history_vector.expand_as(cached_kv[1])
+
+        # zero vector for padding in the gather # kv is shape [2, B, H, N, D] so zero vector is [2, B, H, 1, D] # add extra dimension for kvs from different layers
+        kv = kv.unsqueeze(0).expand(2, *kv.shape) # expand as cached_kv contatins current and above layer # these are coupled so gather only needs to be done once
+        zero_vector = torch.zeros_like(kv[:, :, :, :, :1, :]) # used as the padding index in the gather
+        #cached_kv[1] += self.history_vector.expand_as(cached_kv[1])
         new_kv = torch.cat([cached_kv, kv, zero_vector], dim=-2)
-    
         new_kv = torch.gather(new_kv, dim=-2, index=cached_kv_indices)
 
         return new_kv
@@ -438,4 +461,4 @@ class CosineAttention(nn.Module):
 
         out = rearrange(out, "b h n d -> b n (h d)")
         out = self.out_proj(out)
-        return out, cur_l_kv
+        return out, cur_l_kv.half()
