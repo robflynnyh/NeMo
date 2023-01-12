@@ -56,7 +56,7 @@ class DynamicPositionBiasXL(nn.Module):
     '''Adapted From Phil Wang's x-transformers library
        Altered to work with attention matrix that is not square
     '''
-    def __init__(self, dim, *, heads, depth, log_distance = False, norm = False, init_history_decay = 2.0):
+    def __init__(self, dim, *, heads, depth, log_distance = False, norm = False, init_history_decay = 1.0):
         super().__init__()
         assert depth >= 1, 'depth for dynamic position bias MLP must be greater or equal to 1'
         self.log_distance = log_distance
@@ -77,7 +77,7 @@ class DynamicPositionBiasXL(nn.Module):
             ))
 
         self.mlp.append(nn.Linear(dim, heads))
-        self.history_decay = nn.Parameter(torch.ones(1) * init_history_decay)
+        self.history_decay = nn.Parameter(torch.ones(heads, 1, 1) * init_history_decay)
       
 
     @staticmethod
@@ -87,7 +87,7 @@ class DynamicPositionBiasXL(nn.Module):
             'depth': kwargs.get('dpos_depth', 2),
             'log_distance': kwargs.get('dpos_log_distance', False),
             'norm': kwargs.get('dpos_norm', False),
-            'init_history_decay': kwargs.get('dpos_init_history_decay', 2.0)
+            'init_history_decay': kwargs.get('dpos_init_history_decay', 1.0)
         }
 
     def forward(self, i, j, device, dtype):

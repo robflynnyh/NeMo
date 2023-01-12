@@ -198,12 +198,12 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
         cached_kv = rearrange(cached_kv, 'kv b h n d -> (kv b h) n d')
         pad_mask = repeat(pad_mask, 'b n -> (kv b h) n', kv=KV, b=B, h=H)
         vq_cached_kv, indices, commit_loss = self.VQ(cached_kv, mask=~pad_mask)
-   
+        
         vq_cached_kv = rearrange(vq_cached_kv, '(kv b h) n d -> kv b h n d', kv=KV, b=B, h=H, n=N, d=D)
         return vq_cached_kv, commit_loss
         
     @staticmethod
-    def get_cache_indices(x_lens, cache_lens, cache_kv, x): 
+    def get_cache_indices(x_lens, cache_lens, cache_kv, x):  # replace with a vmap
         # used later w/ gather to remove padding when cache is concatenated with current input
         max_new_len = (x_lens + cache_lens).max()
 
@@ -409,19 +409,19 @@ class CosineAttention(nn.Module):
     def attend(self, query, key, value, attn_mask, pos_fn):
         dots = einsum('bhid,bhjd->bhij', query, key) * self.temperature
         dots = self.head_proj(dots, mode='pre')
-        #print(dots.shape)
-        pos = pos_fn(i=dots.shape[-2], j=dots.shape[-1], device=dots.device, dtype=dots.dtype)
 
-        #dots += pos
+        pos = pos_fn(i=dots.shape[-2], j=dots.shape[-1], device=dots.device, dtype=dots.dtype)
+        dots += pos
         
         dots.masked_fill_(attn_mask, -torch.finfo(dots.dtype).max)
 
         attn = self.activation(dots)
         attn = self.head_proj(attn, mode='post')
-
+    
         '''if self.layer_idx == 0:
-            print(attn.shape)'''
-        '''if attn.shape[-1] != attn.shape[-2]:
+            print(attn.shape)
+        
+        if attn.shape[-1] != attn.shape[-2] and attn.shape[-1] > 2500:
             import pickle as pkl
             pkl.dump(attn.detach().to('cpu'), open(f'attn_{self.layer_idx}.pkl', 'wb'))
             if self.layer_idx == 11:
