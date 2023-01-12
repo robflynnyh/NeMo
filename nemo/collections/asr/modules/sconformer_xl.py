@@ -461,4 +461,8 @@ class CosineAttention(nn.Module):
 
         out = rearrange(out, "b h n d -> b n (h d)")
         out = self.out_proj(out)
+        #print(cur_l_kv.shape)
+        # permute cur_l_kv to mix up the batch dimension (test)
+        #cur_l_kv = cur_l_kv[:, torch.randperm(cur_l_kv.shape[1]), :, :, :]
+        #print(cur_l_kv.shape)
         return out, cur_l_kv.half()
