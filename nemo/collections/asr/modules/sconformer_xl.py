@@ -35,6 +35,7 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
         checkpoint_every_n_layers = 1,
         subsampling_factor = 4,
         conv_kernel_size = 31,
+        commitment_loss = 0.25,
         **kwargs
     ):
         super().__init__()
@@ -59,7 +60,7 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
             dim = head_dim,
             codebook_size = 256,
             use_cosine_sim = True,
-            commitment_weight = 0.25,
+            commitment_weight = commitment_loss,
             codebook_dim = head_dim // 2,
         )
 
