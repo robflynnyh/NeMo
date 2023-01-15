@@ -17,7 +17,6 @@ from torch.utils.checkpoint import checkpoint # # gradient/activation checkpoint
 
 from einops import rearrange, repeat
 from torch import einsum
-from vector_quantize_pytorch import VectorQuantize
 
 
 class SelfConditionedConformerXL(NeuralModule, Exportable):
@@ -36,6 +35,9 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
         subsampling_factor = 4,
         conv_kernel_size = 31,
         commitment_loss = 0.25,
+        codebook_size = 64,
+        vq_cosine_sim = True,
+        codebook_dim = 8,
         **kwargs
     ):
         super().__init__()
@@ -56,12 +58,13 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
 
         self.position_bias = DynamicPositionBiasXL(heads = n_heads, **DynamicPositionBiasXL.fetch_module_kwargs(kwargs))
 
+        from vector_quantize_pytorch import VectorQuantize
         self.VQ = VectorQuantize(
             dim = head_dim,
-            codebook_size = 256,
-            use_cosine_sim = True,
+            codebook_size = codebook_size,
+            use_cosine_sim = vq_cosine_sim,
             commitment_weight = commitment_loss,
-            codebook_dim = head_dim // 2,
+            codebook_dim = codebook_dim
         )
 
         self.subsampling = ConvSubsampling(
@@ -268,11 +271,14 @@ class ConformerLayer(nn.Module):
 
         d_ff = d_model * expansion_factor
 
-        self.conv = PreNorm(d_model = d_model, fn = ConformerConvolution(
-            d_model = d_model,
-            kernel_size = conv_kernel_size,
-            norm_type = 'batch_renorm'
-        ))
+        self.conv = PreNorm(
+            d_model = d_model, 
+            fn = ConformerConvolution(
+                d_model = d_model,
+                kernel_size = conv_kernel_size,
+                norm_type = 'batch_renorm'
+            ),
+        )
 
         self.do_conv = nn.Dropout(dropout_conv)
 
@@ -281,16 +287,19 @@ class ConformerLayer(nn.Module):
         self.ff2 = Scale(0.5, PreNorm(d_model = d_model, fn = ConformerFeedForward(**ff_args)))
         self.do_ff = nn.Dropout(dropout_ff)
 
-        self.attend = PreNorm(d_model = d_model, fn = CosineAttention(
-            n_feats = d_model,
-            head_dim = head_dim,
-            n_heads = n_heads,
-            dropout = dropout_attn,
-            bias = False,
-            temperature = kwargs.get('temperature', 15.5),
-            activation = 'softmax',
-            layer_idx = layer_idx,
-        ))
+        self.attend = PreNorm(
+            d_model = d_model, 
+            fn = CosineAttention(
+                n_feats = d_model,
+                head_dim = head_dim,
+                n_heads = n_heads,
+                dropout = dropout_attn,
+                bias = False,
+                temperature = kwargs.get('temperature', 15.5),
+                activation = 'softmax',
+                layer_idx = layer_idx,
+            )
+        )
 
         self.do_attn_out = nn.Dropout(min(dropout_ff, 0.1)) # don't wan't this too large
 
@@ -335,7 +344,7 @@ def l2norm(t, groups = 1, dim = -1):
     t = F.normalize(t, p = 2, dim = dim)
     return rearrange(t, '... g d -> ... (g d)')
 
-class SpatialAttnDropout(nn.Module): # this is a inefficient way to do this. todo (could use normal d0 and group dimensions?)
+class SpatialAttnDropout(nn.Module): # this is a inefficient way to do this, use triton?
     def __init__(self, p = 0.25, spatial_size = 5):
         super().__init__()
         self.p = p
@@ -412,6 +421,8 @@ class CosineAttention(nn.Module):
         dots = self.head_proj(dots, mode='pre')
 
         pos = pos_fn(i=dots.shape[-2], j=dots.shape[-1], device=dots.device, dtype=dots.dtype)
+        #import pickle as pkl
+        #pkl.dump(pos.detach().to('cpu'), open(f'bias.pkl', 'wb'))
         dots += pos
         
         dots.masked_fill_(attn_mask, -torch.finfo(dots.dtype).max)
@@ -422,11 +433,11 @@ class CosineAttention(nn.Module):
         '''if self.layer_idx == 0:
             print(attn.shape)
         
-        if attn.shape[-1] != attn.shape[-2] and attn.shape[-1] > 2500:
+        if attn.shape[-1] != attn.shape[-2]:
             import pickle as pkl
             pkl.dump(attn.detach().to('cpu'), open(f'attn_{self.layer_idx}.pkl', 'wb'))
             if self.layer_idx == 11:
-                exit()#'''
+                exit()'''
         
 
         attn = self.dropout(attn)
