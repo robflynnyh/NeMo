@@ -80,7 +80,8 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         talking_heads = 'pre', # only implemented with cosine attn atm 'pre' or 'post' or 'both' or 'none'
         hydra_weighting = False, # https://arxiv.org/pdf/2209.07484.pdf
         spatial_attention_dropout = False,
-        bottleneck_initial_ff = False
+        bottleneck_initial_ff = False,
+        shared_kv = True,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -157,12 +158,12 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             if hydra_weighting == False or layer_idx <= 5:
                 self.self_attn = CosineAttention(
                     n_feats = d_model,
-                    head_dim = max(32, d_model // n_heads),
+                    head_dim = max(16, d_model // n_heads),
                     n_heads = n_heads,
                     bias = False,
                     temperature = 15.5,
                     causal = False,
-                    shared_kv = True,
+                    shared_kv = shared_kv,
                     talking_heads = talking_heads,
                     dropout = dropout_att,
                     spatial_attention_dropout = spatial_attention_dropout

@@ -169,7 +169,8 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
         chunk_window = 8, #
         hydra_weighting = False, # https://arxiv.org/pdf/2209.07484.pdf
         spatial_attention_dropout = False, # only imped with cosine sim attn
-        bottleneck_initial_ff = False
+        bottleneck_initial_ff = False,
+        shared_kv = True,
     ):
         super().__init__()
 
@@ -290,6 +291,7 @@ class SelfConditionedConformerEncoder(NeuralModule, Exportable):
                 hydra_weighting=hydra_weighting,
                 spatial_attention_dropout=spatial_attention_dropout, # only imped with cosine sim attn
                 bottleneck_initial_ff = bottleneck_initial_ff,
+                shared_kv = shared_kv,
             )
             self.layers.append(layer)
 

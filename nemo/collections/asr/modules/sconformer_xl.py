@@ -198,6 +198,7 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
 
     def vector_quantize_cached_states(self, cached_kv, pad_mask, device, dtype):
         KV, B, H, N, D = cached_kv.shape
+    
         cached_kv = cached_kv.to(device=device, dtype=dtype)
         cached_kv = rearrange(cached_kv, 'kv b h n d -> (kv b h) n d')
         pad_mask = repeat(pad_mask, 'b n -> (kv b h) n', kv=KV, b=B, h=H)
@@ -225,7 +226,7 @@ class SelfConditionedConformerXL(NeuralModule, Exportable):
             indices.append(new_indices)
 
         indices = torch.stack(indices, dim=0)
-
+        
         indices = rearrange(indices, 'b n -> () () b () n ()').expand(2, 2,B,H,-1,D)
         return indices.to(x.device)
 
@@ -475,6 +476,6 @@ class CosineAttention(nn.Module):
         out = self.out_proj(out)
         #print(cur_l_kv.shape)
         # permute cur_l_kv to mix up the batch dimension (test)
-        #cur_l_kv = cur_l_kv[:, torch.randperm(cur_l_kv.shape[1]), :, :, :]
+        #cur_l_kv = cur_l_kv[:, torch.randperm(cur_l_kv.shape[1]), :, :, :] + torch.randn_like(cur_l_kv)*100
         #print(cur_l_kv.shape)
-        return out, cur_l_kv.half()
+        return out, cur_l_kv.half() 
