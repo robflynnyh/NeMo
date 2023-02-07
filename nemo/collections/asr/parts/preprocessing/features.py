@@ -1,4 +1,4 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+    # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -52,12 +52,13 @@ def normalize_batch(x, seq_len, normalize_type, groups=None):
         x_std = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
         for i in range(x.shape[0]):
             if x[i, :, : seq_len[i]].shape[1] == 1:
-                raise ValueError(
-                    "normalize_batch with `per_feature` normalize_type received a tensor of length 1. This will result "
-                    "in torch.std() returning nan"
-                )
-            x_mean[i, :] = x[i, :, : seq_len[i]].mean(dim=1)
-            x_std[i, :] = x[i, :, : seq_len[i]].std(dim=1)
+                # std of a single element is nan and mean is the element itself
+                x_mean[i, :] = x[i, :, 0]
+                x_std[i, :] = 1.0 
+                # hence we don't normalize
+            else:
+                x_mean[i, :] = x[i, :, : seq_len[i]].mean(dim=1)
+                x_std[i, :] = x[i, :, : seq_len[i]].std(dim=1)
         # make sure x_std is not zero
         x_std += CONSTANT
         return (x - x_mean.unsqueeze(2)) / x_std.unsqueeze(2)

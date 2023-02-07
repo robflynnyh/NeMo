@@ -42,9 +42,9 @@ import sys
 import kenlm_utils
 import torch
 
-import nemo.collections.asr as nemo_asr
-from nemo.utils import logging
 
+from nemo.utils import logging
+from nemo.collections import nlp as nemo_nlp
 """
 NeMo's beam search decoders only support char-level encodings. In order to make it work with BPE-level encodings, we
 use a trick to encode the sub-word tokens of the training data as unicode characters and train a char-level KenLM. 
@@ -56,6 +56,9 @@ TOKEN_OFFSET = 100
 CHUNK_SIZE = 8192
 CHUNK_BUFFER_SIZE = 512
 
+def load_tokenizer(model_path):
+    tokenizer_spe = nemo_nlp.modules.get_tokenizer(tokenizer_name="sentencepiece", tokenizer_model=model_path)
+    return tokenizer_spe
 
 def main():
     parser = argparse.ArgumentParser(
@@ -67,11 +70,12 @@ def main():
         type=str,
         help="Path to the training file, it can be a text file or JSON manifest",
     )
+
     parser.add_argument(
-        "--nemo_model_file",
+        '-tokenizer','--tokenizer',
         required=True,
         type=str,
-        help="The path of the '.nemo' file of the ASR model or name of a pretrained model",
+        help="Path to the tokenizer model file",
     )
     parser.add_argument(
         "--kenlm_model_file", required=True, type=str, help="The path to store the KenLM binary model file"
@@ -83,23 +87,9 @@ def main():
     )
     args = parser.parse_args()
 
-    """ TOKENIZER SETUP """
-    logging.info(f"Loading nemo model '{args.nemo_model_file}' ...")
-
-    if args.nemo_model_file.endswith('.nemo'):
-        model = nemo_asr.models.ASRModel.restore_from(args.nemo_model_file, map_location=torch.device('cpu'))
-    else:
-        logging.warning(
-            "nemo_model_file does not end with .nemo, therefore trying to load a pretrained model with this name."
-        )
-        model = nemo_asr.models.ASRModel.from_pretrained(args.nemo_model_file, map_location=torch.device('cpu'))
-
-    encoding_level = kenlm_utils.SUPPORTED_MODELS.get(type(model).__name__, None)
-    if not encoding_level:
-        logging.warning(
-            f"Model type '{type(model).__name__}' may not be supported. Would try to train a char-level LM."
-        )
-        encoding_level = 'char'
+ 
+    encoding_level = 'subword'
+    tokenizer = load_tokenizer(model_path=args.tokenizer)
 
     """ DATASET SETUP """
     logging.info(f"Encoding the train file '{args.train_file}' ...")
@@ -108,7 +98,7 @@ def main():
     if encoding_level == "subword":
         kenlm_utils.tokenize_text(
             dataset,
-            model.tokenizer,
+            tokenizer,
             path=encoded_train_file,
             chunk_size=CHUNK_SIZE,
             buffer_size=CHUNK_BUFFER_SIZE,
@@ -122,8 +112,6 @@ def main():
                 f.write(f"{line}\n")
 
         discount_arg = ""
-
-    del model
 
     arpa_file = f"{args.kenlm_model_file}.tmp.arpa"
     """ LMPLZ ARGUMENT SETUP """
