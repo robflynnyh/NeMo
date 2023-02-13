@@ -82,6 +82,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         spatial_attention_dropout = False,
         bottleneck_initial_ff = False,
         shared_kv = True,
+        temperature = 15.5,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -161,7 +162,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                     head_dim = max(16, d_model // n_heads),
                     n_heads = n_heads,
                     bias = False,
-                    temperature = 15.5,
+                    temperature = temperature,
                     causal = False,
                     shared_kv = shared_kv,
                     talking_heads = talking_heads,
