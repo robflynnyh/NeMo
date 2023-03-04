@@ -539,7 +539,7 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
 
         assert not (reproject_type == 'concat' and gating), "concat_reprojection and gating can't be used together"
         assert auxilary_training == False, "Not implemented yet"
-        assert reproject_type in ['linear', 'conv', 'concat'], "reproject_type should be either 'linear' or 'conv' or 'concat'"
+        assert reproject_type in ['linear', 'conv', 'concat', 'none'], "reproject_type should be either 'linear' or 'conv' or 'concat' or none (inter-ctc)"
         if auxilary_training == True:
             assert reproject_type == 'linear', "reproject_type should be 'linear' when auxilary_training is True"
         
@@ -580,9 +580,10 @@ class ConvASRSelfConditioningDecoder(NeuralModule, Exportable, adapter_mixins.Ad
             torch.nn.Conv1d(self._feat_in, self._num_classes, kernel_size=1, bias=True)
         )
 
-        self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim. Change to linear !
-            torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) if reproject_type == 'conv' else torch.nn.Linear(self._num_classes, self._feat_in, bias=True)
-        ) if reproject_type != 'concat' else torch.nn.Linear(self._num_classes + self._feat_in, self._feat_in, bias=True)
+        if reproject_type != 'none':
+            self.reprojection_layers = torch.nn.Sequential( # project from logspace back to model dim. Change to linear !
+                torch.nn.Conv1d(self._num_classes, self._feat_in, kernel_size=1, bias=True) if reproject_type == 'conv' else torch.nn.Linear(self._num_classes, self._feat_in, bias=True)
+            ) if reproject_type != 'concat' else torch.nn.Linear(self._num_classes + self._feat_in, self._feat_in, bias=True)
 
 
         self.gating = gating

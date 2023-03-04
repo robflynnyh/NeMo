@@ -59,6 +59,13 @@ def read_train_file(path, lowercase: bool = False):
 
     return text_dataset
 
+def __tokenize_str(texts, tokenizer):
+    tokenized_text = []
+    for text in texts:
+        tok_text = tokenizer.text_to_ids(text)
+        tok_text = [chr(token + 100) for token in tok_text]
+        tokenized_text.append(tok_text)
+    return tokenized_text
 
 def tokenize_str(texts, tokenizer, offset):
     tokenized_text = []

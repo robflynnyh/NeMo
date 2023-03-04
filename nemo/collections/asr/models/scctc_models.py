@@ -496,6 +496,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             "segment_lens": NeuralType(tuple('S'), LengthsType(), optional=True),
             "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True),
             "return_cross_utterance_attention": NeuralType(tuple(), BoolType(), optional=True),
+            "logits": NeuralType(None, BoolType(), optional=True),
         }
 
     @property
@@ -505,7 +506,7 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
             "interim_posteriors": NeuralType(('H', 'B', 'T', 'D'), LogprobsType()),
             "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
             "greedy_predictions": NeuralType(('B', 'T'), LabelsType()),
-            "other_outputs": NeuralType(None, optional=True),
+            "other_outputs": NeuralType(None, optional=True)
         }
 
     @typecheck()
@@ -516,7 +517,8 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
         processed_signal=None, 
         processed_signal_length=None, 
         segment_lens=None, 
-        return_cross_utterance_attention=None
+        return_cross_utterance_attention=None,
+        logits=False,
     ):
         """
         Forward pass of the model.
@@ -577,11 +579,11 @@ class EncDecSCCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin):
 
         additional_outputs = None if len(encoder_out) == 3 else encoder_out[3]
 
-        log_probs = self.decoder(encoder_output=encoded, logits=False)
-
-
+        log_probs = self.decoder(encoder_output=encoded, logits=logits)
         
         greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
+      
+
         return log_probs, iterim_posteriors, encoded_len, greedy_predictions, additional_outputs
        
 
